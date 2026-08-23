@@ -55,7 +55,8 @@ def cmd_calibrate(args):
             print(f"Use --force to overwrite.")
             return
 
-    calibrate(args.model_dir, ram_gb=args.ram, quick=args.quick)
+    calibrate(args.model_dir, ram_gb=args.ram, quick=args.quick,
+              ppl_tolerance=args.ppl_tolerance)
 
 
 def cmd_run(args):
@@ -214,6 +215,10 @@ def main():
     p.add_argument("--ram", type=float, default=None, help="Override RAM (GB)")
     p.add_argument("--quick", action="store_true", help="Skip bias sweep (2 min)")
     p.add_argument("--force", action="store_true", help="Overwrite existing calibration")
+    p.add_argument("--ppl-tolerance", type=float, default=None,
+                   help="Bias passes if decode-ppl <= baseline * tolerance "
+                        "(default 1.05; e.g. 1.10 trades ~6%% ppl for ~50%% speed "
+                        "by admitting bias 0.5 on Qwen3-30B)")
 
     # run
     p = sub.add_parser("run", help="Generate text from a prompt")

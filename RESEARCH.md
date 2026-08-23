@@ -154,6 +154,57 @@ This means a single model handles **text + images + web search** on 8 GB hardwar
 
 All model files (GGUF weights, mmproj vision projector) can live on a **USB flash drive or external SSD**. The madvise prefetch hints help the OS prioritize the right expert pages under memory pressure. This enables fully portable AI — plug in a USB drive and run a 35B multimodal model on any Mac.
 
+## v0.2 Findings: Re-measuring on Corrected Code (2026-08)
+
+The v0.2 release fixed four measurement-corrupting bugs (prefetch results
+silently discarded; cache probes that mutated hit-rate stats and LRU order;
+no thread safety; calibration configured differently from serving). Re-running
+on Qwen3-30B-A3B-4bit (M4 Mac Mini, 16 GB, 886-expert cache) changed the
+conclusions, not just the numbers:
+
+**1. The cache-aware routing bias trades quality for speed — measurably.**
+Token-by-token teacher-forced perplexity on held-out text, cache warmed as in
+serving:
+
+| bias | decode ppl | generation speed |
+|---|---|---|
+| 0.0 | 4.18 | 1.15 tok/s |
+| 0.5 | 4.42 (+5.7%) | 1.70 tok/s (+48%) |
+| 1.0 | 6.38 (+53%) | — |
+| 1.5 | 14.11 (+238%) | — |
+
+The earlier "bias 1.0 universal sweet spot" claim was validated by checking
+two trivia answers as substrings — a gate this coarse cannot see a +53% ppl
+degradation. v0.2 defaults to bias 0 and admits a bias only if decode-ppl
+stays within a configured tolerance of baseline (default 5%).
+
+**2. Prefill perplexity is structurally blind to bias damage.** A 512-token
+prefill activates ~80% of experts per layer, so a bias toward cached experts
+barely changes routing; bias 1.5 measured 4.33 by prefill-ppl (within 5% of
+the 4.37 baseline — and identical to 3 decimals at 0.5/1.0/1.5, a saturation
+tell) while measuring 13.1 by decode-ppl. Any evaluation of cache-aware
+routing must run in decode mode.
+
+**3. Co-activation prefetch is bandwidth-neutral on this hardware.** Before
+v0.2, a dict-overwrite bug discarded every predicted-expert read unconsumed —
+the predictor burned SSD bandwidth for exactly zero benefit, on every code
+path. Fixing it doubled consumed prefetch reads (1,810 → 3,407 per 100
+tokens) at unchanged tok/s: the reads it saves were already overlapped with
+compute. The "70% cross-layer prediction accuracy" was real, but accuracy
+does not translate to speedup when the SSD is not the binding constraint.
+
+**4. Swap is the silent killer of SSD streaming.** Sizing the expert cache
+from total RAM on a machine running other apps pushed 14.8 GB into swap on
+the same SSD the experts stream from: reads collapsed from ~2 GB/s to 42
+MB/s and generation to 0.21 tok/s — a 50x penalty with no error anywhere.
+v0.2 caps the cache by measured-available RAM (vm_stat) instead.
+
+A related disk-safety bug in preprocessing: deleting a source shard freed no
+space while any lazily-loaded (mmap-backed) tensor from it was still
+referenced — the "download → split → delete" pipeline could fill the disk
+while apparently deleting as it went. v0.2 persists pinned tensors per shard
+and round-trips cross-shard tensors through a carry file before deletion.
+
 ## Honest Results: Three-Way A/B Test
 
 ### llama.cpp Expert Memory Management (clean A/B on same hardware)

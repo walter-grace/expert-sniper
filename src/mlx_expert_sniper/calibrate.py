@@ -272,8 +272,10 @@ def sweep_routing_bias(model_dir, cache_size, bias_values=BIAS_VALUES,
     return best, results
 
 
-def calibrate(model_dir, ram_gb=None, quick=False):
+def calibrate(model_dir, ram_gb=None, quick=False, ppl_tolerance=None):
     import mlx.core as mx, gc
+    if ppl_tolerance is None:
+        ppl_tolerance = PPL_TOLERANCE
 
     print(f"{'='*60}")
     print(f"mlx-sniper calibrate")
@@ -306,8 +308,9 @@ def calibrate(model_dir, ram_gb=None, quick=False):
               "trusting quality at this bias.")
     else:
         print(f"\nStep 3: Routing bias sweep {BIAS_VALUES} "
-              f"(perplexity gate, tolerance {PPL_TOLERANCE}x)")
-        best_bias, bias_sweep_ppl = sweep_routing_bias(model_dir, cache_size)
+              f"(decode-ppl gate, tolerance {ppl_tolerance}x)")
+        best_bias, bias_sweep_ppl = sweep_routing_bias(
+            model_dir, cache_size, ppl_tolerance=ppl_tolerance)
         print(f"  Sweet spot: {best_bias}")
 
     config = {
@@ -323,7 +326,7 @@ def calibrate(model_dir, ram_gb=None, quick=False):
         "routing_bias": best_bias,
         "bias_sweep_ppl": ({str(k): round(v, 4) for k, v in bias_sweep_ppl.items()}
                            if bias_sweep_ppl else None),
-        "ppl_tolerance": PPL_TOLERANCE,
+        "ppl_tolerance": ppl_tolerance,
         "reap_threshold": 0.01,
         "reap_dead_pct": float(dead_pct),
         "coact_warmup_tokens": 3,

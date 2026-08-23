@@ -35,9 +35,12 @@ def _get_engine():
         _model_name = config.get("model_type", model_type) or model_type
     except Exception:
         _model_name = model_type
-    _model_size = sum(
-        os.path.getsize(os.path.join(root, name))
-        for root, _, names in os.walk(_model_dir) for name in names)
+    _model_size = 0
+    for root, _, names in os.walk(_model_dir):
+        for name in names:
+            p = os.path.join(root, name)
+            if not os.path.islink(p):  # layer_XX.bin symlinks alias real files
+                _model_size += os.lstat(p).st_size
     print(f"  Model loaded ({_model_name}, bias={_bias}).", flush=True)
     return _engine
 

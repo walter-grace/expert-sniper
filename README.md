@@ -41,18 +41,44 @@ Already have an MLX 4-bit checkpoint? `mlx-sniper preprocess <src> <out>`.
    layer's predicted + selected experts, fused active-expert FFN via
    `gather_qmm`, and the router nudged toward already-cached experts.
 
-## Performance
+## Performance (v0.2, measured)
 
-Measured on an M4 Mac Mini, 16 GB RAM (see RESEARCH.md for methodology):
+Qwen3-30B-A3B 4-bit (17 GB on disk, 128 experts), M4 Mac Mini 16 GB with
+other apps running, 886-expert (2.3 GB) cache, 100-token generations,
+decode-mode perplexity on held-out text:
 
-| Model | Size on disk | Speed | Notes |
+| Routing bias | Speed | Decode ppl | Cache hit rate |
 |---|---|---|---|
-| Qwen3.5-35B-A3B 4-bit | 19.5 GB | 5.37 tok/s | 256 experts, TTFT 2.9 s |
-| Qwen3-30B-A3B 4-bit | 17.2 GB | 3.34 tok/s | 128 experts |
+| 0.0 (default) | 1.15 tok/s | 4.18 | 51% |
+| 0.5 (opt-in: `--ppl-tolerance 1.10`) | 1.70 tok/s (+48%) | 4.42 (+5.7%) | 62% |
+| 1.0 | — | 6.38 (+53%) | quality cliff |
+| 1.5 | — | 14.11 (+238%) | quality cliff |
 
-> These numbers predate the v0.2 correctness fixes (honest cache-hit
-> accounting, working co-activation prefetch, perplexity-gated bias) and are
-> being re-measured; v0.2 numbers will replace them here.
+TTFT ~11 s; sustained SSD streaming 1.7–2.3 GB/s at 1.2–1.9 ms/expert.
+
+Three honest findings from re-measuring on the fixed code (details in
+RESEARCH.md):
+
+1. **The routing bias trades quality for speed** — it is not free. Earlier
+   releases shipped bias 1.0–1.5 as a "sweet spot" validated by a two-prompt
+   substring check; decode-mode perplexity shows 1.0+ degrades the model
+   badly. v0.2 defaults to bias 0 and gates any bias on measured perplexity.
+2. **Prefill perplexity cannot see bias damage** (prefill activates ~80% of
+   experts per layer, so the cache-aware bias barely engages) — the
+   calibration gate must measure token-by-token decode.
+3. **Co-activation prefetch is bandwidth-neutral here**: fixing the bug that
+   discarded its reads doubled consumed prefetches (1,810 → 3,407 per 100
+   tokens) at unchanged tok/s. The old "70% prediction accuracy → speedup"
+   framing was not realizable.
+
+Practical note: on a 16 GB machine, cache sizing must respect *available*
+RAM, not total — an oversized expert cache pushes the OS into swap on the
+same SSD the experts stream from, and throughput collapses ~50× (measured
+0.21 tok/s vs 1.7). `calibrate` handles this automatically.
+
+Earlier published figures (5.37 tok/s 35B, 3.34 tok/s 30B, "92% cache hit")
+were measured on code with corrupted hit-rate accounting and a bias level
+that decode-ppl shows was damaging quality; treat them as superseded.
 
 An `--expert-cache-size` madvise patch for llama.cpp (see `llama-cpp/`)
 produced 0.57 tok/s for a 30B MoE on an 8 GB M2 Air where stock llama.cpp
