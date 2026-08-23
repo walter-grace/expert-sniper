@@ -149,6 +149,7 @@ def make_forward(engine, bias=0.0):
                     engine.reader.prefetch_experts(i+1, active_ids)
 
             if remote_compute is not None:
+                expert_data = None
                 expert_out = remote_compute(i, normed, active_ids, inds, scores)
             else:
                 expert_data = engine.reader.get_experts(i, active_ids)
