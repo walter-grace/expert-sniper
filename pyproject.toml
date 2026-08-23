@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mlx-expert-sniper"
+version = "0.2.0"
+description = "Run MoE models larger than RAM on Apple Silicon via expert sniping"
+license = "MIT"
+requires-python = ">=3.9"
+dependencies = [
+    "mlx>=0.22.0",
+    "mlx-lm>=0.22.0",
+    "transformers>=4.40.0",
+    "numpy",
+    "huggingface-hub",
+]
+
+[project.scripts]
+mlx-sniper = "mlx_expert_sniper.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
