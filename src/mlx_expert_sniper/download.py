@@ -118,18 +118,25 @@ def download_model(model_name, output_dir=None, calibrate_quick=True, keep_downl
     print(f"  This may take 10-30 minutes depending on your connection.\n")
 
     from huggingface_hub import snapshot_download
-    snapshot_download(repo, local_dir=download_dir)
+    if info.get("preprocess") == "gemma4":
+        snapshot_download(repo, local_dir=download_dir)
+    else:
+        # Weight shards are fetched one at a time during preprocessing and
+        # deleted as they're consumed, so peak disk stays near the final
+        # model size instead of double it.
+        snapshot_download(repo, local_dir=download_dir,
+                          ignore_patterns=["model-*.safetensors"])
     print(f"  Download complete.\n")
 
     # Step 2: Preprocess (split into streaming format)
     print(f"Step 2/3: Preprocessing into sniper streaming format...")
-    print(f"  This takes ~5-20 minutes. Shards are deleted after processing to save disk.\n")
+    print(f"  This takes ~5-20 minutes. Shards are fetched and deleted one at a time.\n")
 
     if info.get("preprocess") == "gemma4":
         from .preprocess_gemma4 import preprocess_gemma4
         preprocess_gemma4(download_dir, output_dir)
     else:
-        _preprocess(download_dir, output_dir)
+        _preprocess(download_dir, output_dir, repo=repo)
 
     # Clean up download dir
     if not keep_download:
@@ -191,6 +198,10 @@ def _write_layer(output_dir, layer_idx, lt, num_experts, verify=True):
     header_padded = header_json + b"\x00" * (PAGE_SIZE - len(header_json))
 
     layer_path = os.path.join(output_dir, "bin", f"moe_layer_{layer_idx:02d}.bin")
+    expected_size = PAGE_SIZE + num_experts * expert_block_size
+    if os.path.exists(layer_path) and os.path.getsize(layer_path) == expected_size:
+        return 0  # already written by a previous (interrupted) run
+
     layer_bytes = PAGE_SIZE
     with open(layer_path, "wb") as f:
         f.write(header_padded)
@@ -221,85 +232,164 @@ def _write_layer(output_dir, layer_idx, lt, num_experts, verify=True):
     return layer_bytes
 
 
-def _preprocess(download_dir, output_dir, delete_shards=True):
+def _shard_names(download_dir):
+    """Full shard list from the safetensors index (works even when some
+    shards were already deleted by an interrupted run), else glob."""
+    index_path = os.path.join(download_dir, "model.safetensors.index.json")
+    if os.path.exists(index_path):
+        index = json.load(open(index_path))
+        names = sorted(set(index["weight_map"].values()))
+        return names
+    return [os.path.basename(p) for p in
+            sorted(glob.glob(os.path.join(download_dir, "model-*.safetensors")))]
+
+
+def _free_gb(path):
+    st = os.statvfs(path)
+    return st.f_bavail * st.f_frsize / 1e9
+
+
+def _preprocess(download_dir, output_dir, delete_shards=True, repo=None):
     """Split MLX 4-bit model into pinned + streaming experts.
 
     delete_shards=True frees disk as it goes (download flow); pass False
     when preprocessing a checkpoint the user supplied themselves.
+
+    Disk-safety notes (learned the hard way):
+    - mx.load() returns lazy arrays backed by the shard's mmap. Any tensor
+      still referenced when the shard file is deleted keeps the file's
+      blocks allocated (POSIX), so "delete to free disk" silently frees
+      nothing. Therefore pinned tensors are persisted to per-shard part
+      files immediately, and incomplete cross-shard expert tensors are
+      round-tripped through a carry file, so nothing references a shard's
+      mmap by the time it is removed.
+    - Layers already fully written by a previous interrupted run are
+      skipped, and with `repo` set, missing shards are downloaded one at a
+      time (present shards are processed first) — so an interrupted run
+      resumes with minimal disk and no re-download of finished work.
     """
     import mlx.core as mx
 
     os.makedirs(output_dir, exist_ok=True)
     os.makedirs(os.path.join(output_dir, "bin"), exist_ok=True)
+    parts_dir = os.path.join(output_dir, "pinned_parts")
+    os.makedirs(parts_dir, exist_ok=True)
 
     config = json.load(open(os.path.join(download_dir, "config.json")))
     tc = config.get("text_config", config)
     NUM_LAYERS = tc["num_hidden_layers"]
     NUM_EXPERTS = tc["num_experts"]
 
-    shard_files = sorted(glob.glob(os.path.join(download_dir, "model-*.safetensors")))
-    print(f"  Model: {NUM_LAYERS} layers, {NUM_EXPERTS} experts, {len(shard_files)} shards")
+    names = _shard_names(download_dir)
+    # Process locally-present shards first so missing ones are downloaded
+    # only after their disk has been freed.
+    local = [n for n in names if os.path.exists(os.path.join(download_dir, n))]
+    missing = [n for n in names if n not in local]
+    ordered = local + missing
+    print(f"  Model: {NUM_LAYERS} layers, {NUM_EXPERTS} experts, "
+          f"{len(names)} shards ({len(local)} local, {len(missing)} to fetch)")
 
-    pinned = {}
     expert_layers_done = set()
     expert_keys = {}
+    carry_paths = [os.path.join(output_dir, "carry_a.safetensors"),
+                   os.path.join(output_dir, "carry_b.safetensors")]
+    carry_gen = 0
     t0 = time.time()
     total_expert_bytes = 0
 
-    for si, sf in enumerate(shard_files):
-        shard_name = os.path.basename(sf)
-        print(f"  Shard {si+1}/{len(shard_files)}: {shard_name}")
+    def flush_layers(final=False):
+        nonlocal total_expert_bytes
+        for layer_idx in sorted(expert_keys.keys()):
+            if layer_idx in expert_layers_done:
+                continue
+            lt = expert_keys[layer_idx]
+            if len(lt) < len(TENSOR_ORDER):
+                if final:
+                    print(f"  WARNING: Layer {layer_idx} incomplete "
+                          f"({len(lt)}/{len(TENSOR_ORDER)} tensors)")
+                continue
+            layer_bytes = _write_layer(output_dir, layer_idx, lt, NUM_EXPERTS)
+            total_expert_bytes += layer_bytes
+            expert_layers_done.add(layer_idx)
+            del expert_keys[layer_idx]
+            gc.collect()
+            elapsed = time.time() - t0
+            note = "skipped (exists)" if layer_bytes == 0 else f"{layer_bytes/1e6:.1f} MB"
+            print(f"    Layer {layer_idx:2d}/{NUM_LAYERS}: {note} ({elapsed:.0f}s)")
+
+    for si, shard_name in enumerate(ordered):
+        sf = os.path.join(download_dir, shard_name)
+        if not os.path.exists(sf):
+            if repo is None:
+                raise FileNotFoundError(f"{sf} missing and no repo to fetch from")
+            print(f"  Fetching {shard_name} ({_free_gb(download_dir):.1f} GB free)...")
+            from huggingface_hub import hf_hub_download
+            hf_hub_download(repo, shard_name, local_dir=download_dir)
+
+        print(f"  Shard {si+1}/{len(ordered)}: {shard_name} "
+              f"({_free_gb(download_dir):.1f} GB free)")
         w = mx.load(sf)
 
+        shard_pinned = {}
         for k, v in w.items():
             if "switch_mlp" in k:
                 m = re.search(r"layers\.(\d+)\.", k)
                 layer_idx = int(m.group(1))
                 local_name = k.split(f"layers.{layer_idx}.mlp.")[-1]
-                if layer_idx not in expert_keys:
-                    expert_keys[layer_idx] = {}
-                expert_keys[layer_idx][local_name] = v
+                expert_keys.setdefault(layer_idx, {})[local_name] = v
             else:
-                pinned[k] = v
+                shard_pinned[k] = v
 
-        # Write complete layers
-        for layer_idx in sorted(expert_keys.keys()):
-            if layer_idx in expert_layers_done:
-                continue
-            if len(expert_keys[layer_idx]) < len(TENSOR_ORDER):
-                continue
+        flush_layers()
 
-            lt = expert_keys[layer_idx]
-            layer_bytes = _write_layer(output_dir, layer_idx, lt, NUM_EXPERTS)
-            total_expert_bytes += layer_bytes
-            expert_layers_done.add(layer_idx)
-            del expert_keys[layer_idx]
-            elapsed = time.time() - t0
-            print(f"    Layer {layer_idx:2d}/{NUM_LAYERS}: {layer_bytes/1e6:.1f} MB ({elapsed:.0f}s)")
+        # Persist this shard's pinned tensors NOW so no lazy reference into
+        # the shard's mmap survives its deletion.
+        if shard_pinned:
+            part_path = os.path.join(parts_dir, f"part_{shard_name}")
+            mx.save_safetensors(part_path, shard_pinned)
+        del shard_pinned
+
+        # Round-trip incomplete cross-shard expert tensors through a carry
+        # file for the same reason.
+        pending = {li: lt for li, lt in expert_keys.items()
+                   if li not in expert_layers_done}
+        if pending and delete_shards:
+            flat = {f"L{li}|{name}": t
+                    for li, lt in pending.items() for name, t in lt.items()}
+            new_carry = carry_paths[carry_gen % 2]
+            mx.save_safetensors(new_carry, flat)
+            del flat
+            reloaded = mx.load(new_carry)
+            expert_keys = {}
+            for key, t in reloaded.items():
+                li_s, name = key.split("|", 1)
+                expert_keys.setdefault(int(li_s[1:]), {})[name] = t
+            old_carry = carry_paths[(carry_gen + 1) % 2]
+            if os.path.exists(old_carry):
+                os.remove(old_carry)
+            carry_gen += 1
 
         del w; gc.collect()
         if delete_shards:
             os.remove(sf)
-            print(f"    Deleted {shard_name} to free disk")
+            print(f"    Deleted {shard_name} to free disk "
+                  f"({_free_gb(download_dir):.1f} GB free)")
 
-    # Handle any layers split across shards (incomplete after last shard)
-    for layer_idx in sorted(expert_keys.keys()):
-        if layer_idx in expert_layers_done:
-            continue
-        lt = expert_keys[layer_idx]
-        if len(lt) < len(TENSOR_ORDER):
-            print(f"  WARNING: Layer {layer_idx} incomplete ({len(lt)}/{len(TENSOR_ORDER)} tensors)")
-            continue
-        layer_bytes = _write_layer(output_dir, layer_idx, lt, NUM_EXPERTS)
-        total_expert_bytes += layer_bytes
-        print(f"    Layer {layer_idx:2d}/{NUM_LAYERS}: {layer_bytes/1e6:.1f} MB (cross-shard)")
+    flush_layers(final=True)
+    for cp in carry_paths:
+        if os.path.exists(cp):
+            os.remove(cp)
 
-    # Save pinned
+    # Merge pinned parts
+    pinned = {}
+    part_files = sorted(glob.glob(os.path.join(parts_dir, "part_*")))
+    for pf in part_files:
+        pinned.update(mx.load(pf))
     pinned_bytes = sum(v.nbytes for v in pinned.values())
-    import mlx.core as mx
     mx.save_safetensors(os.path.join(output_dir, "pinned.safetensors"), pinned)
     print(f"  Saved pinned.safetensors: {pinned_bytes/1e9:.2f} GB ({len(pinned)} keys)")
     del pinned; gc.collect()
+    shutil.rmtree(parts_dir, ignore_errors=True)
 
     # Symlinks: layer_XX.bin -> moe_layer_XX.bin
     for i in range(NUM_LAYERS):
