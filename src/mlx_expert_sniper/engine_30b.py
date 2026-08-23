@@ -8,7 +8,7 @@ from mlx.utils import tree_flatten
 from .expert_io import MoEExpertReader
 from .coactivation import CoActivationTracker
 
-MODEL_DIR = "/Users/bigneek/models/qwen3-30b-stream"
+MODEL_DIR = None  # set by generate.load_engine / calibrate._build_engine
 BITS = 4
 GROUP_SIZE = 64
 
@@ -54,9 +54,14 @@ class MoESniperEngine30B:
         self._enable_prediction = enable_prediction
 
     def load(self):
+        if MODEL_DIR is None:
+            raise RuntimeError(
+                "engine_30b.MODEL_DIR is not set — load via "
+                "generate.load_engine(model_dir), which sets it")
         with open(f"{MODEL_DIR}/config.json") as f:
             config = json.load(f)
         self.num_layers = config["num_hidden_layers"]
+        self.num_experts = config["num_experts"]
         streaming = config["streaming"]
 
         from mlx_lm.models.qwen3_moe import Model, ModelArgs
@@ -112,6 +117,8 @@ class MoESniperEngine30B:
     def reset_cache(self):
         from mlx_lm.models.cache import KVCache
         self.cache = [KVCache() for _ in range(self.num_layers)]
+        if self.reader:
+            self.reader.reset_prefetch()
 
     def forward(self, input_ids):
         from mlx_lm.models.base import create_attention_mask
@@ -149,7 +156,7 @@ class MoESniperEngine30B:
                 if predicted:
                     to_fetch = []
                     for eid in predicted:
-                        if self.reader.lru and self.reader.lru.get(i + 1, eid) is None:
+                        if self.reader.lru and not self.reader.lru.contains(i + 1, eid):
                             to_fetch.append(eid)
                     if to_fetch:
                         self.reader.prefetch_experts(i + 1, to_fetch)

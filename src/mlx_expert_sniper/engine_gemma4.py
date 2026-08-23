@@ -14,7 +14,7 @@ from mlx.utils import tree_flatten
 from .expert_io import MoEExpertReader
 from .coactivation import CoActivationTracker
 
-MODEL_DIR = ""
+MODEL_DIR = None  # set by generate.load_engine / calibrate._build_engine
 BITS = 8  # Q8 experts
 GROUP_SIZE = 32  # Q8 group size from GGUF
 
@@ -91,9 +91,14 @@ class MoESniperEngineGemma4:
         self.per_expert_scales = {}  # layer -> [128] float array
 
     def load(self):
+        if not MODEL_DIR:
+            raise RuntimeError(
+                "engine_gemma4.MODEL_DIR is not set — load via "
+                "generate.load_engine(model_dir), which sets it")
         with open(os.path.join(MODEL_DIR, "config.json")) as f:
             config = json.load(f)
         self.num_layers = config["num_hidden_layers"]
+        self.num_experts = config.get("num_experts", 128)
         streaming = config.get("streaming", {})
 
         # Load model using our custom gemma4 model class
@@ -182,6 +187,8 @@ class MoESniperEngineGemma4:
 
     def reset_cache(self):
         self.cache = self.model.make_cache()
+        if self.reader:
+            self.reader.reset_prefetch()
 
     def forward(self, input_ids):
         """Forward pass with expert streaming from SSD.
@@ -237,7 +244,7 @@ class MoESniperEngineGemma4:
                     predicted = self.coact.predict_next_layer(i, active_ids, top_k=6)
                     if predicted:
                         to_fetch = [eid for eid in predicted
-                                    if self.reader.lru and self.reader.lru.get(i+1, eid) is None]
+                                    if self.reader.lru and not self.reader.lru.contains(i+1, eid)]
                         if to_fetch:
                             self.reader.prefetch_experts(i+1, to_fetch)
                 if i + 1 < self.num_layers:

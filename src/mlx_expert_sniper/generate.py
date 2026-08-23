@@ -5,6 +5,19 @@ import numpy as np
 STOP_TOKENS = {"<|im_end|>", "<|endoftext|>", "<|im_start|>"}
 
 
+def eos_token_ids(tok):
+    """EOS ids derived from the tokenizer (models disagree on the ids)."""
+    ids = set()
+    eos = getattr(tok, "eos_token_id", None)
+    if eos is not None:
+        ids.update(eos if isinstance(eos, list) else [eos])
+    for t in STOP_TOKENS:
+        i = tok.convert_tokens_to_ids(t)
+        if i is not None and i >= 0:
+            ids.add(i)
+    return ids
+
+
 def load_engine(model_dir):
     """Load engine with calibration. Returns (engine, bias, model_type)."""
     os.environ["TOKENIZERS_PARALLELISM"] = "false"
@@ -54,7 +67,7 @@ def generate_stream(engine, messages, bias=0.0, max_tokens=200):
 
     from .engine import run_expert_ffn
     has_ssm = hasattr(engine.model.model, 'fa_idx')
-    num_experts = 256 if has_ssm else 128
+    num_experts = engine.num_experts
 
     engine.reset_cache()
     tok = engine.tokenizer
@@ -97,9 +110,9 @@ def generate_stream(engine, messages, bias=0.0, max_tokens=200):
             raw_logits = layer.mlp.gate(normed)
             if bias > 0 and engine.reader.lru is not None:
                 cached_mask = np.zeros(num_experts, dtype=np.float32)
-                for eid in range(num_experts):
-                    if engine.reader.lru.get(i, eid) is not None:
-                        cached_mask[eid] = bias
+                ids = engine.reader.lru.cached_ids(i)
+                if ids:
+                    cached_mask[ids] = bias
                 raw_logits = raw_logits + mx.array(cached_mask).reshape(1, -1)
 
             gates = mx.softmax(raw_logits, axis=-1, precise=True)
@@ -116,7 +129,7 @@ def generate_stream(engine, messages, bias=0.0, max_tokens=200):
                 predicted = engine.coact.predict_next_layer(i, active_ids, top_k=6)
                 if predicted:
                     to_fetch = [eid for eid in predicted
-                                if engine.reader.lru and engine.reader.lru.get(i+1, eid) is None]
+                                if engine.reader.lru and not engine.reader.lru.contains(i+1, eid)]
                     if to_fetch:
                         engine.reader.prefetch_experts(i+1, to_fetch)
             if i + 1 < engine.num_layers:
@@ -144,7 +157,7 @@ def generate_stream(engine, messages, bias=0.0, max_tokens=200):
     logits = forward(input_ids)
     mx.eval(logits)
 
-    eos_ids = {248044, 248045}
+    eos_ids = eos_token_ids(tok)
     tok_obj = engine.tokenizer
 
     for _ in range(max_tokens):
@@ -178,14 +191,7 @@ def _generate_stream_gemma4(engine, messages, max_tokens=200):
     logits = engine.forward(input_ids)
     mx.eval(logits)
 
-    # Gemma 4 EOS tokens
-    eos_ids = set()
-    if hasattr(tok, 'eos_token_id'):
-        if isinstance(tok.eos_token_id, list):
-            eos_ids.update(tok.eos_token_id)
-        elif tok.eos_token_id is not None:
-            eos_ids.add(tok.eos_token_id)
-    eos_ids.update({1, 106, 212})  # Gemma 4 EOS tokens
+    eos_ids = eos_token_ids(tok) | {1, 106, 212}  # + Gemma 4 EOS tokens
 
     for _ in range(max_tokens):
         token = mx.argmax(logits[:, -1, :], axis=-1)
