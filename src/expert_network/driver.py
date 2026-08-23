@@ -14,7 +14,8 @@ import sys
 import time
 
 
-def run(model_dir, nodes, prompt=None, max_tokens=200, chat=False):
+def run(model_dir, nodes, prompt=None, max_tokens=200, chat=False,
+        spec=False, spec_k=8):
     from mlx_expert_sniper.generate import load_engine, generate_stream
     from .reader import DistributedExpertReader
 
@@ -33,11 +34,19 @@ def run(model_dir, nodes, prompt=None, max_tokens=200, chat=False):
               f"{h.get('memory_gb', '?')} GB)")
 
     def generate(messages):
+        spec_stats = {}
+        if spec:
+            from mlx_expert_sniper.speculative import spec_generate_stream
+            stream = spec_generate_stream(engine, messages, bias=0.0,
+                                          max_tokens=max_tokens, k=spec_k,
+                                          stats=spec_stats)
+        else:
+            stream = generate_stream(engine, messages, bias=0.0,
+                                     max_tokens=max_tokens)
         t0 = time.time()
         n = 0
         first = None
-        for chunk in generate_stream(engine, messages, bias=0.0,
-                                     max_tokens=max_tokens):
+        for chunk in stream:
             if first is None:
                 first = time.time() - t0
             sys.stdout.write(chunk)
@@ -46,6 +55,10 @@ def run(model_dir, nodes, prompt=None, max_tokens=200, chat=False):
         dt = time.time() - t0
         tps = n / (dt - first) if first and dt > first and n else 0
         print(f"\n\n  [{n} tok, {tps:.2f} tok/s, TTFT {first:.1f}s]")
+        if spec_stats.get("forwards"):
+            print(f"  Spec: {spec_stats['forwards']} forwards for {n} tokens "
+                  f"({n/spec_stats['forwards']:.2f} tok/forward), "
+                  f"accepted {spec_stats['accepted']}/{spec_stats['drafted']}")
         print(f"  {engine.reader.stats()}\n")
 
     if chat:
@@ -74,11 +87,15 @@ def main():
     parser.add_argument("--prompt", "-p", default=None)
     parser.add_argument("--chat", action="store_true")
     parser.add_argument("--max-tokens", type=int, default=200)
+    parser.add_argument("--spec", action="store_true",
+                        help="Speculative decoding (prompt-lookup drafts)")
+    parser.add_argument("--spec-k", type=int, default=8)
     args = parser.parse_args()
     if not args.chat and not args.prompt:
         parser.error("need --prompt or --chat")
     run(args.model_dir, args.nodes.split(","), prompt=args.prompt,
-        max_tokens=args.max_tokens, chat=args.chat)
+        max_tokens=args.max_tokens, chat=args.chat,
+        spec=args.spec, spec_k=args.spec_k)
 
 
 if __name__ == "__main__":

@@ -79,11 +79,24 @@ def cmd_run(args):
 
     messages = [{"role": "user", "content": args.prompt}]
 
+    spec_stats = {}
+    if args.spec:
+        from .speculative import spec_generate_stream, ModelDraft
+        draft = (ModelDraft(args.draft_model, eng.tokenizer)
+                 if args.draft_model else None)
+        stream = spec_generate_stream(eng, messages, bias=bias,
+                                      max_tokens=args.max_tokens,
+                                      k=args.spec_k, draft=draft,
+                                      stats=spec_stats)
+    else:
+        stream = generate_stream(eng, messages, bias=bias,
+                                 max_tokens=args.max_tokens)
+
     t0 = time.time()
     token_count = 0
     first_token_time = None
 
-    for chunk in generate_stream(eng, messages, bias=bias, max_tokens=args.max_tokens):
+    for chunk in stream:
         if first_token_time is None:
             first_token_time = time.time()
         sys.stdout.write(chunk)
@@ -97,6 +110,13 @@ def cmd_run(args):
     if args.verbose:
         print(f"\n\n  {token_count} tokens | {tps:.2f} tok/s | TTFT: {ttft:.2f}s | "
               f"Total: {elapsed:.2f}s")
+        if spec_stats.get("forwards"):
+            acc = (spec_stats["accepted"] / spec_stats["drafted"]
+                   if spec_stats["drafted"] else 0)
+            print(f"  Spec: {spec_stats['forwards']} forwards for "
+                  f"{token_count} tokens ({token_count/spec_stats['forwards']:.2f} "
+                  f"tok/forward), drafted={spec_stats['drafted']}, "
+                  f"accepted={spec_stats['accepted']} ({acc:.0%})")
         print(f"  Cache: {eng.reader.stats()}")
         print(f"  Metal: {mx.get_active_memory()/1e9:.2f} GB")
     else:
@@ -256,6 +276,11 @@ def main():
     p.add_argument("--prompt", "-p", required=True, help="Text prompt")
     p.add_argument("--max-tokens", type=int, default=200)
     p.add_argument("--verbose", "-v", action="store_true")
+    p.add_argument("--spec", action="store_true",
+                   help="Speculative decoding (prompt-lookup drafts by default)")
+    p.add_argument("--spec-k", type=int, default=8, help="Draft tokens per step")
+    p.add_argument("--draft-model", default=None,
+                   help="Tokenizer-compatible draft model path/repo")
 
     # chat
     p = sub.add_parser("chat", help="Interactive multi-turn chat")
