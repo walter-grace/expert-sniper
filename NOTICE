@@ -1,0 +1,18 @@
+Expert Sniper
+Copyright (c) 2026 Walter Grace. MIT License (see LICENSE).
+
+Third-party software
+--------------------
+
+llama.cpp (https://github.com/ggml-org/llama.cpp)
+  MIT License, Copyright (c) 2023-2026 The ggml authors.
+  This repository vendors NO llama.cpp source. The files under
+  llama-cpp/patches/src/ are original Expert Sniper code designed to be
+  compiled inside a llama.cpp checkout; llama-cpp/patches/apply.sh modifies
+  a user-provided llama.cpp checkout (CMake target list, common/common.h,
+  common/arg.cpp, common/common.cpp) with a few lines each. Those
+  modifications, once applied, are distributed under llama.cpp's MIT license
+  terms alongside its copyright notice.
+
+Held-out evaluation text (src/mlx_expert_sniper/data/eval_text.txt)
+  Excerpt from "Pride and Prejudice" by Jane Austen (1813). Public domain.
