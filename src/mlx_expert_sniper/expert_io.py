@@ -15,14 +15,18 @@ backfills the 4-bit version for the next token.
 import os
 import json
 import fcntl
+import logging
 import mmap
+import threading
 import time
 import numpy as np
-from collections import OrderedDict
+from collections import OrderedDict, defaultdict
 from concurrent.futures import ThreadPoolExecutor
 
 F_NOCACHE = 48
 PAGE_SIZE = 16384
+
+log = logging.getLogger("mlx_expert_sniper.expert_io")
 
 
 class DownProjFallback:
@@ -32,7 +36,9 @@ class DownProjFallback:
     On cache miss:
       gate_proj → pread from SSD (4-bit, full quality)
       up_proj   → pread from SSD (4-bit, full quality)
-      down_proj → instant dequant from mmap'd ternary buffer (0.89 cosine)
+      down_proj → instant dequant from mmap'd ternary buffer
+                  (~0.89 cosine estimated for ternary; 0.81 measured for
+                  the 1-bit legacy format — see bench/test_ternary_sensitivity.py)
 
     Ternary: {-scale, 0, +scale} per group. Captures sparsity.
     Packing: 2 bits per value (00=zero, 01=+scale, 10=-scale), 4 per byte.
@@ -164,40 +170,71 @@ class DownProjFallback:
 
 
 class LRUExpertCache:
-    """LRU cache for parsed expert data. Skips SSD reads on cache hits."""
+    """LRU cache for parsed expert data. Skips SSD reads on cache hits.
+
+    Thread-safe: `put` may be called from backfill threads while the main
+    thread reads. `get` is the only accessor that counts hits/misses and
+    refreshes recency — use `contains`/`peek`/`cached_ids` for probes so
+    stats stay honest and eviction order stays true LRU.
+    """
 
     def __init__(self, max_experts=100):
         self.max_experts = max_experts
         self.cache = OrderedDict()  # (layer_idx, expert_id) → parsed expert dict
         self.hits = 0
         self.misses = 0
+        self._lock = threading.RLock()
+        self._by_layer = defaultdict(set)  # layer_idx → {expert_id}
 
     def get(self, layer_idx, expert_id):
         key = (layer_idx, expert_id)
-        if key in self.cache:
-            self.hits += 1
-            self.cache.move_to_end(key)
-            return self.cache[key]
-        self.misses += 1
-        return None
+        with self._lock:
+            if key in self.cache:
+                self.hits += 1
+                self.cache.move_to_end(key)
+                return self.cache[key]
+            self.misses += 1
+            return None
 
     def put(self, layer_idx, expert_id, data):
         key = (layer_idx, expert_id)
-        if key in self.cache:
-            self.cache.move_to_end(key)
-        else:
-            if len(self.cache) >= self.max_experts:
-                self.cache.popitem(last=False)
-            self.cache[key] = data
+        with self._lock:
+            if key in self.cache:
+                self.cache.move_to_end(key)
+                self.cache[key] = data
+            else:
+                if len(self.cache) >= self.max_experts:
+                    (l, e), _ = self.cache.popitem(last=False)
+                    self._by_layer[l].discard(e)
+                self.cache[key] = data
+                self._by_layer[layer_idx].add(expert_id)
+
+    def contains(self, layer_idx, expert_id):
+        """Existence probe: no stats, no recency update."""
+        with self._lock:
+            return (layer_idx, expert_id) in self.cache
+
+    def peek(self, layer_idx, expert_id):
+        """Value or None: no stats, no recency update."""
+        with self._lock:
+            return self.cache.get((layer_idx, expert_id))
+
+    def cached_ids(self, layer_idx):
+        """Snapshot of expert ids cached for a layer (for the routing-bias mask)."""
+        with self._lock:
+            return list(self._by_layer.get(layer_idx, ()))
 
     def hit_rate(self):
-        total = self.hits + self.misses
-        return self.hits / total if total > 0 else 0.0
+        with self._lock:
+            total = self.hits + self.misses
+            return self.hits / total if total > 0 else 0.0
 
     def stats(self):
-        total = self.hits + self.misses
-        return (f"cache: {len(self.cache)}/{self.max_experts} entries, "
-                f"hit_rate={self.hit_rate():.1%} ({self.hits}/{total})")
+        with self._lock:
+            total = self.hits + self.misses
+            rate = self.hits / total if total > 0 else 0.0
+            return (f"cache: {len(self.cache)}/{self.max_experts} entries, "
+                    f"hit_rate={rate:.1%} ({self.hits}/{total})")
 
 
 class MoEExpertReader:
@@ -213,7 +250,13 @@ class MoEExpertReader:
                  fallback_path=None):
         self.expert_dir = expert_dir
         self.num_layers = num_layers
-        self.executor = ThreadPoolExecutor(max_workers=num_workers)
+        self.executor = ThreadPoolExecutor(
+            max_workers=num_workers, thread_name_prefix="sniper-read")
+        # Backfill parses on its own single worker: submitting it to the read
+        # pool would let backfill jobs occupy every worker while blocking on
+        # read futures queued behind them (pool self-deadlock).
+        self.backfill_executor = ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="sniper-backfill")
 
         # LRU cache (0 = disabled)
         self.lru = LRUExpertCache(max_experts=cache_size) if cache_size > 0 else None
@@ -240,22 +283,38 @@ class MoEExpertReader:
         self.data_start = h0["data_start"]
         self.tensor_layout = h0["tensors"]
 
-        # Stats
+        # Fail fast if a fallback buffer is configured but the streaming
+        # format doesn't carry the down_proj tensor it needs.
+        if self.fallback and "switch_mlp.down_proj.weight" not in self.tensor_layout:
+            raise ValueError(
+                "fallback_path is set but this model's tensor layout has no "
+                "'switch_mlp.down_proj.weight' — the mixed-precision fallback "
+                f"can't map into it (layout keys: {list(self.tensor_layout)})")
+
+        # Stats. Counters are mutated by the main thread and the backfill
+        # thread — guard with _stats_lock.
+        self._stats_lock = threading.Lock()
         self.read_time = 0.0
         self.reads = 0
         self.bytes_read = 0
         self.cache_hits = 0
+        self.prefetch_hits = 0
+        self.backfill_errors = 0
 
-        # Prefetch state
+        # Prefetch state. Only touched from the caller thread
+        # (prefetch_experts / get_experts) — no lock needed.
         self.prefetch_futures = {}
 
+        self._fd_lock = threading.Lock()
+
     def _get_fd(self, layer_idx):
-        if layer_idx not in self.fds:
-            path = f"{self.expert_dir}/layer_{layer_idx:02d}.bin"
-            fd = os.open(path, os.O_RDONLY)
-            fcntl.fcntl(fd, F_NOCACHE, 1)
-            self.fds[layer_idx] = fd
-        return self.fds[layer_idx]
+        with self._fd_lock:
+            if layer_idx not in self.fds:
+                path = f"{self.expert_dir}/layer_{layer_idx:02d}.bin"
+                fd = os.open(path, os.O_RDONLY)
+                fcntl.fcntl(fd, F_NOCACHE, 1)
+                self.fds[layer_idx] = fd
+            return self.fds[layer_idx]
 
     def _read_expert(self, layer_idx, expert_id):
         """Read one expert's data via pread. Thread-safe."""
@@ -293,15 +352,37 @@ class MoEExpertReader:
         return result
 
     def prefetch_experts(self, layer_idx, expert_ids):
-        """Launch parallel pread for experts not in cache. Non-blocking."""
-        futures = {}
+        """Launch parallel preads for experts not cached and not already in
+        flight. Non-blocking. Repeat calls for the same layer MERGE — the
+        forward pass prefetches both predicted and active experts for the
+        next layer, and the second call must not discard the first's reads.
+        """
+        if os.environ.get("SNIPER_LEGACY_PREFETCH"):
+            # Pre-fix behavior for A/B benchmarking: second call for the same
+            # layer overwrites the first, discarding predicted-expert reads.
+            # TODO: remove this toggle before tagging v1.
+            futures = {}
+            for eid in expert_ids:
+                if self.lru and self.lru.contains(layer_idx, eid):
+                    continue
+                futures[eid] = self.executor.submit(self._read_expert, layer_idx, eid)
+            self.prefetch_futures[layer_idx] = futures
+            return
+
+        pending = self.prefetch_futures.setdefault(layer_idx, {})
         for eid in expert_ids:
-            # Skip prefetch if already cached
-            if self.lru and (layer_idx, eid) in self.lru.cache:
+            if eid in pending:
+                continue  # already in flight
+            if self.lru and self.lru.contains(layer_idx, eid):
                 continue
-            future = self.executor.submit(self._read_expert, layer_idx, eid)
-            futures[eid] = future
-        self.prefetch_futures[layer_idx] = futures
+            pending[eid] = self.executor.submit(self._read_expert, layer_idx, eid)
+
+    def reset_prefetch(self):
+        """Cancel and drop all outstanding prefetch futures (new request)."""
+        for futures in self.prefetch_futures.values():
+            for fut in futures.values():
+                fut.cancel()
+        self.prefetch_futures.clear()
 
     def _read_expert_partial(self, layer_idx, expert_id):
         """Read gate_proj + up_proj from SSD (skip down_proj). Thread-safe."""
@@ -309,7 +390,7 @@ class MoEExpertReader:
         offset = self.data_start + expert_id * self.expert_block_size
         # Read only gate + up + their scales/biases (first 1,179,648 bytes)
         # down_proj starts at inner_offset 1,179,648
-        down_offset = self.tensor_layout["mlp.switch_mlp.down_proj.weight"]["inner_offset"]
+        down_offset = self.tensor_layout["switch_mlp.down_proj.weight"]["inner_offset"]
         data = os.pread(fd, down_offset, offset)
         return data
 
@@ -345,7 +426,8 @@ class MoEExpertReader:
         Mixed-precision fallback strategy:
           Cache HIT  → all 3 projections from 4-bit cache (gather_qmm)
           Cache MISS → gate+up from SSD pread (4-bit, 2/3 I/O)
-                     → down from 1-bit mmap buffer (instant, 0.81 cosine)
+                     → down from mmap fallback buffer (instant;
+                       0.81 cosine measured 1-bit, ~0.89 estimated ternary)
                      → async backfill: full expert from SSD into cache
 
         Returns: dict[expert_id] → dict[tensor_name → mx.array]
@@ -359,6 +441,9 @@ class MoEExpertReader:
         experts = {}
         futures = self.prefetch_futures.pop(layer_idx, {})
         backfill_futures = {}
+        bytes_read = 0
+        cache_hits = 0
+        prefetch_hits = 0
 
         for eid in expert_ids:
             # 1. Check LRU cache
@@ -366,7 +451,7 @@ class MoEExpertReader:
                 cached = self.lru.get(layer_idx, eid)
                 if cached is not None:
                     experts[eid] = cached
-                    self.cache_hits += 1
+                    cache_hits += 1
                     continue
 
             # 2. Check prefetched data (already read from SSD)
@@ -374,21 +459,22 @@ class MoEExpertReader:
                 raw = futures[eid].result()
                 parsed = self._parse_expert_data(raw, eid)
                 experts[eid] = parsed
-                self.bytes_read += len(raw)
+                bytes_read += len(raw)
+                prefetch_hits += 1
                 if self.lru:
                     self.lru.put(layer_idx, eid, parsed)
                 continue
 
             # 3. Cache miss
             if self.fallback:
-                # Mixed precision: gate+up from SSD, down from 1-bit
+                # Mixed precision: gate+up from SSD, down from fallback buffer
                 raw_partial = self._read_expert_partial(layer_idx, eid)
                 parsed = self._parse_expert_partial(raw_partial, eid)
-                self.bytes_read += len(raw_partial)
+                bytes_read += len(raw_partial)
 
-                # down_proj from 1-bit fallback (instant)
+                # down_proj from fallback buffer (instant)
                 down_f16 = self.fallback.get_down_proj_f16(layer_idx, eid)
-                parsed["mlp.switch_mlp.down_proj.weight"] = down_f16
+                parsed["switch_mlp.down_proj.weight"] = down_f16
 
                 experts[eid] = parsed
 
@@ -401,15 +487,38 @@ class MoEExpertReader:
                 raw = self._read_expert(layer_idx, eid)
                 parsed = self._parse_expert_data(raw, eid)
                 experts[eid] = parsed
-                self.bytes_read += len(raw)
+                bytes_read += len(raw)
                 if self.lru:
                     self.lru.put(layer_idx, eid, parsed)
+
+        # Leftover prefetched futures (prefetched but not activated this
+        # token): a completed read is already paid for — bank it in the
+        # cache; a queued-not-started read frees its worker via cancel.
+        for eid, fut in futures.items():
+            if eid in experts:
+                continue
+            if fut.done():
+                try:
+                    raw = fut.result()
+                    if self.lru:
+                        self.lru.put(layer_idx, eid,
+                                     self._parse_expert_data(raw, eid))
+                    bytes_read += len(raw)
+                except Exception as e:
+                    log.warning("prefetch read failed L%d E%d: %s",
+                                layer_idx, eid, e)
+            else:
+                fut.cancel()
 
         if backfill_futures:
             self._schedule_backfill(layer_idx, backfill_futures)
 
-        self.read_time += time.time() - t0
-        self.reads += len(expert_ids)
+        with self._stats_lock:
+            self.read_time += time.time() - t0
+            self.reads += len(expert_ids)
+            self.bytes_read += bytes_read
+            self.cache_hits += cache_hits
+            self.prefetch_hits += prefetch_hits
         return experts
 
     def _schedule_backfill(self, layer_idx, futures):
@@ -419,12 +528,15 @@ class MoEExpertReader:
                 try:
                     raw = future.result()
                     parsed = self._parse_expert_data(raw, eid)
-                    self.bytes_read += len(raw)
+                    with self._stats_lock:
+                        self.bytes_read += len(raw)
                     if self.lru:
                         self.lru.put(layer_idx, eid, parsed)
-                except Exception:
-                    pass
-        self.executor.submit(_do_backfill)
+                except Exception as e:
+                    with self._stats_lock:
+                        self.backfill_errors += 1
+                    log.warning("backfill failed L%d E%d: %s", layer_idx, eid, e)
+        self.backfill_executor.submit(_do_backfill)
 
     def stats(self):
         if self.reads == 0:
@@ -433,10 +545,13 @@ class MoEExpertReader:
         avg_ms = self.read_time / self.reads * 1000
         throughput = self.bytes_read / self.read_time / 1e9 if self.read_time > 0 else 0
         s = (f"reads={self.reads}, ssd_reads={ssd_reads}, cache_hits={self.cache_hits}, "
+             f"prefetch_hits={self.prefetch_hits}, "
              f"avg={avg_ms:.1f}ms/expert, "
              f"throughput={throughput:.1f} GB/s, "
              f"total_bytes={self.bytes_read/1e9:.2f} GB, "
              f"total_time={self.read_time:.1f}s")
+        if self.backfill_errors:
+            s += f"\n  backfill_errors={self.backfill_errors}"
         if self.lru:
             s += f"\n  {self.lru.stats()}"
         if self.fallback:
@@ -444,8 +559,10 @@ class MoEExpertReader:
         return s
 
     def close(self):
+        self.reset_prefetch()
+        self.executor.shutdown(wait=False)
+        self.backfill_executor.shutdown(wait=False)
         for fd in self.fds.values():
             os.close(fd)
-        self.executor.shutdown(wait=False)
         if self.fallback:
             self.fallback.close()
