@@ -357,18 +357,6 @@ class MoEExpertReader:
         forward pass prefetches both predicted and active experts for the
         next layer, and the second call must not discard the first's reads.
         """
-        if os.environ.get("SNIPER_LEGACY_PREFETCH"):
-            # Pre-fix behavior for A/B benchmarking: second call for the same
-            # layer overwrites the first, discarding predicted-expert reads.
-            # TODO: remove this toggle before tagging v1.
-            futures = {}
-            for eid in expert_ids:
-                if self.lru and self.lru.contains(layer_idx, eid):
-                    continue
-                futures[eid] = self.executor.submit(self._read_expert, layer_idx, eid)
-            self.prefetch_futures[layer_idx] = futures
-            return
-
         pending = self.prefetch_futures.setdefault(layer_idx, {})
         for eid in expert_ids:
             if eid in pending:

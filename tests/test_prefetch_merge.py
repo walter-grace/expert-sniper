@@ -34,13 +34,6 @@ def test_prefetch_dedupes_in_flight_and_cached(reader):
     assert 3 in reader.prefetch_futures[1]
 
 
-def test_legacy_toggle_reproduces_overwrite(reader, monkeypatch):
-    monkeypatch.setenv("SNIPER_LEGACY_PREFETCH", "1")
-    reader.prefetch_experts(1, [0, 1])
-    reader.prefetch_experts(1, [2, 3])
-    assert sorted(reader.prefetch_futures[1]) == [2, 3]
-
-
 def test_prefetched_experts_served_and_counted(reader):
     reader.prefetch_experts(0, [4, 5])
     experts = reader.get_experts(0, [4, 5])
