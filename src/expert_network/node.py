@@ -113,12 +113,13 @@ def compute_expert_ffn(x, expert_data_list, local_indices, top_k_weights):
     return (out * top_k_weights[..., None]).sum(axis=-2)
 
 
-def create_app(experts, expert_ids, num_layers, num_experts):
+def create_app(experts, expert_ids, num_layers, num_experts, model_dir=None):
     from fastapi import FastAPI, Request
     from fastapi.responses import Response
     import mlx.core as mx
 
     app = FastAPI(title="Expert Network Node")
+    expert_dir = os.path.join(model_dir, "bin") if model_dir else None
     partition_set = set(expert_ids)
     partition_arr = np.zeros(num_experts, dtype=bool)
     partition_arr[list(partition_set)] = True
@@ -157,6 +158,27 @@ def create_app(experts, expert_ids, num_layers, num_experts):
         return Response(content=pack_response(n_computed, out_np),
                         media_type="application/octet-stream")
 
+    @app.get("/block/{layer_idx}/{expert_id}")
+    async def block(layer_idx: int, expert_id: int):
+        """Serve one raw expert block. The Machine Yield coordinator uses
+        this as a proof-of-capability challenge: it knows the block's
+        sha256 from the model manifest, so a node can't fake ownership or
+        bandwidth — it either serves the right bytes fast or it doesn't."""
+        if expert_dir is None or expert_id not in partition_set \
+                or not 0 <= layer_idx < num_layers:
+            return Response(status_code=404)
+        layer_path = os.path.join(expert_dir, f"layer_{layer_idx:02d}.bin")
+        header = parse_layer_header(layer_path)
+        layout = header["layout"]
+        fd = os.open(layer_path, os.O_RDONLY)
+        try:
+            raw = os.pread(fd, layout["expert_block_size"],
+                           layout["data_start"]
+                           + expert_id * layout["expert_block_size"])
+        finally:
+            os.close(fd)
+        return Response(content=raw, media_type="application/octet-stream")
+
     @app.get("/health")
     async def health():
         avg_ms = (stats["time"] / stats["count"] * 1000) if stats["count"] else 0
@@ -190,6 +212,15 @@ def main():
                              "compute endpoint — trusted networks only)")
     parser.add_argument("--memory-limit-gb", type=float, default=None,
                         help="Metal memory cap (default: partition size + 25%%)")
+    parser.add_argument("--join", metavar="API_KEY", default=None,
+                        help="Join Machine Yield with your Hero API key")
+    parser.add_argument("--coordinator", default="https://herorunai.com",
+                        help="Machine Yield coordinator")
+    parser.add_argument("--node-id", default=None,
+                        help="Stable node name (default: hostname-port)")
+    parser.add_argument("--advertise-url", default=None,
+                        help="URL the coordinator can reach this node at "
+                             "(default: http://<host>:<port>)")
     args = parser.parse_args()
 
     with open(os.path.join(os.path.expanduser(args.model_dir), "config.json")) as f:
@@ -227,7 +258,27 @@ def main():
     print(f"Loaded {len(experts)} blocks ({total_bytes/1e9:.1f} GB) "
           f"in {time.time()-t0:.1f}s; active {mx.get_active_memory()/1e9:.2f} GB")
 
-    app = create_app(experts, expert_ids, num_layers, num_experts)
+    app = create_app(experts, expert_ids, num_layers, num_experts,
+                     model_dir=model_dir)
+
+    if args.join:
+        import socket
+        from .yield_client import YieldClient
+        node_id = args.node_id or f"{socket.gethostname()}-{args.port}"
+        advertise = args.advertise_url or f"http://{args.host}:{args.port}"
+        yc = YieldClient(args.coordinator, args.join, node_id, advertise, {
+            "model_config": {"num_layers": num_layers,
+                             "num_experts": num_experts,
+                             "expert_block_size": block},
+            "experts_per_layer": len(expert_ids),
+            "expert_ids": sorted(expert_ids),
+            "est_gb": round(est_gb, 2),
+        })
+        yc.join()
+        yc.start_heartbeat(lambda: {
+            "memory_gb": round(mx.get_active_memory() / 1e9, 2),
+        })
+
     import uvicorn
     uvicorn.run(app, host=args.host, port=args.port, log_level="warning")
 

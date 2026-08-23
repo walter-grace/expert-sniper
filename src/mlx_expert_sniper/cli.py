@@ -172,6 +172,36 @@ def cmd_chat(args):
         messages.append({"role": "assistant", "content": full_response})
 
 
+def cmd_manifest(args):
+    """Content-address every expert block: manifest.json of sha256 hashes.
+
+    The Machine Yield coordinator verifies node challenge responses against
+    this, so serving capability is provable, not self-reported."""
+    import hashlib, json
+    model_dir = os.path.expanduser(args.model_dir)
+    with open(os.path.join(model_dir, "config.json")) as f:
+        config = json.load(f)
+    num_layers = config["num_hidden_layers"]
+    num_experts = config["num_experts"]
+    PAGE_SIZE = 16384
+    manifest = {}
+    for li in range(num_layers):
+        path = os.path.join(model_dir, "bin", f"layer_{li:02d}.bin")
+        with open(path, "rb") as f:
+            header = json.loads(f.read(PAGE_SIZE).rstrip(b"\x00"))
+            block = header["layout"]["expert_block_size"]
+            for eid in range(num_experts):
+                f.seek(PAGE_SIZE + eid * block)
+                manifest[f"{li}:{eid}"] = hashlib.sha256(f.read(block)).hexdigest()
+        print(f"  layer {li + 1}/{num_layers}", end="\r", flush=True)
+    out = os.path.join(model_dir, "manifest.json")
+    with open(out, "w") as f:
+        json.dump({"model_type": config.get("model_type"),
+                   "num_layers": num_layers, "num_experts": num_experts,
+                   "expert_block_size": block, "blocks": manifest}, f)
+    print(f"\n{len(manifest)} blocks hashed -> {out}")
+
+
 def cmd_preprocess(args):
     from .preprocess import preprocess
     preprocess(args.src_dir, args.out_dir)
@@ -232,6 +262,10 @@ def main():
     p.add_argument("model_dir", help="Path to sniper model directory")
     p.add_argument("--max-tokens", type=int, default=500)
 
+    # manifest
+    p = sub.add_parser("manifest", help="Write sha256 manifest of all expert blocks")
+    p.add_argument("model_dir", help="Path to sniper model directory")
+
     # preprocess
     p = sub.add_parser("preprocess", help="Split a downloaded MLX model into streaming format")
     p.add_argument("src_dir", help="Downloaded MLX model directory")
@@ -262,6 +296,7 @@ def main():
         "chat": cmd_chat,
         "eval": cmd_eval,
         "preprocess": cmd_preprocess,
+        "manifest": cmd_manifest,
     }
     cmds[args.command](args)
 
