@@ -47,14 +47,21 @@ def test_prefetched_experts_served_and_counted(reader):
     assert np.array_equal(got, want)
 
 
-def test_leftover_prefetch_banked_into_cache(reader):
+def test_leftover_prefetch_parked_in_victim_buffer(reader):
     reader.prefetch_experts(2, [6, 7, 8])
     for fut in reader.prefetch_futures[2].values():
         fut.result()                        # ensure reads complete
     reader.get_experts(2, [6])              # 7, 8 are leftovers
-    assert reader.lru.contains(2, 7)
-    assert reader.lru.contains(2, 8)
+    # Speculation must NOT pollute the main LRU...
+    assert not reader.lru.contains(2, 7)
+    assert (2, 7) in reader.victim and (2, 8) in reader.victim
     assert reader.prefetch_futures.get(2) is None  # popped
+    # ...but a correct speculation is promoted on use, without an SSD read
+    ssd_before = reader.reads - reader.cache_hits
+    reader.get_experts(2, [7])
+    assert reader.victim_hits == 1
+    assert reader.lru.contains(2, 7)
+    assert (2, 7) not in reader.victim
 
 
 def test_reset_prefetch_clears_all(reader):

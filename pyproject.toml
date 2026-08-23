@@ -16,8 +16,13 @@ dependencies = [
     "huggingface-hub",
 ]
 
+[project.optional-dependencies]
+network = ["fastapi", "uvicorn", "requests"]
+
 [project.scripts]
 mlx-sniper = "mlx_expert_sniper.cli:main"
+expert-node = "expert_network.node:main"
+expert-net = "expert_network.driver:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

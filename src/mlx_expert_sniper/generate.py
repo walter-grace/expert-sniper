@@ -76,6 +76,9 @@ def make_forward(engine, bias=0.0):
     has_ssm = hasattr(engine.model.model, 'fa_idx')
     num_experts = engine.num_experts
     predictor = getattr(engine, "predictor", "router")
+    # A reader that exposes compute_distributed evaluates the expert FFN
+    # remotely (the Expert Network tier); otherwise experts stream locally.
+    remote_compute = getattr(engine.reader, "compute_distributed", None)
 
     def forward(inp):
         h = engine.model.model.embed_tokens(inp)
@@ -145,8 +148,11 @@ def make_forward(engine, bias=0.0):
                                 engine.reader.prefetch_experts(i+1, to_fetch)
                     engine.reader.prefetch_experts(i+1, active_ids)
 
-            expert_data = engine.reader.get_experts(i, active_ids)
-            expert_out = run_expert_ffn(normed, expert_data, inds, scores)
+            if remote_compute is not None:
+                expert_out = remote_compute(i, normed, active_ids, inds, scores)
+            else:
+                expert_data = engine.reader.get_experts(i, active_ids)
+                expert_out = run_expert_ffn(normed, expert_data, inds, scores)
 
             if hasattr(layer.mlp, 'shared_expert'):
                 shared_out = layer.mlp.shared_expert(normed)
