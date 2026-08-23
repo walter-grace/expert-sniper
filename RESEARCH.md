@@ -233,6 +233,25 @@ victim buffer and promoted only on demand use (naive promotion measurably
 polluted the cache: 17.4 -> 10.8 tok/s in the lab that produced these
 numbers).
 
+### Speculative decoding (v0.3, measured)
+
+A draft model proposes K=8 tokens; the target verifies them in one forward
+(greedy acceptance, KV rollback via trim). Measured on Qwen3-30B with
+Qwen3-0.6B drafting: **5.0 tokens per forward at 56% draft acceptance** —
+but only +25% end-to-end on the SSD tier (1.44 vs 1.15 tok/s), because a
+9-position verify batch activates a ~60-of-128 expert union per layer,
+which thrashes the cache (0% hits) and reads 64 GB per 60 tokens. The
+free prompt-lookup draft source measured 16% acceptance and is
+break-even-to-slower on both tiers (network: 17.9 vs 19.8 tok/s at 2x
+payload) — below ~40-60% acceptance, speculation costs more than it saves.
+
+The interesting corollary is for the Expert Network: nodes hold experts
+resident, so the verify batch's expert union is nearly free there, and
+tokens-per-forward converts almost directly into round-trip amortization.
+5 tok/forward over a 48-layer, ~3 ms/layer network projects a 30B at
+~25-30 tok/s across two consumer Macs (projection, not yet measured —
+needs two 16 GB machines).
+
 ## Honest Results: Three-Way A/B Test
 
 ### llama.cpp Expert Memory Management (clean A/B on same hardware)
