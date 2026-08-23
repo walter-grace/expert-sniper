@@ -45,6 +45,12 @@ MODEL_REGISTRY = {
         "default_dir": "qwen3-235b-stream",
         "description": "Qwen3-235B-A22B 4-bit (~130 GB, 128 experts, needs 64+ GB RAM)",
     },
+    # Small models — ideal for the Expert Network demo and CI
+    "olmoe-1b-7b": {
+        "repo": "mlx-community/OLMoE-1B-7B-0125-Instruct-4bit",
+        "default_dir": "olmoe-stream",
+        "description": "OLMoE-1B-7B 4-bit (3.6 GB, 64 experts, 8 GB Macs / network demo)",
+    },
     # Gemma 4 (Google) — NEW ARCHITECTURE
     "gemma4-26b": {
         "repo": "google/gemma-4-26B-A4B-it",
@@ -240,8 +246,30 @@ def _shard_names(download_dir):
         index = json.load(open(index_path))
         names = sorted(set(index["weight_map"].values()))
         return names
-    return [os.path.basename(p) for p in
-            sorted(glob.glob(os.path.join(download_dir, "model-*.safetensors")))]
+    names = [os.path.basename(p) for p in
+             sorted(glob.glob(os.path.join(download_dir, "model-*.safetensors")))]
+    single = os.path.join(download_dir, "model.safetensors")
+    if not names and os.path.exists(single):
+        names = ["model.safetensors"]  # single-shard checkpoints (e.g. OLMoE)
+    return names
+
+
+def _stack_experts(w, num_layers, num_experts):
+    """Per-expert checkpoints (mlp.experts.N.*, e.g. OLMoE) → stacked
+    switch_mlp tensors, the format the layer splitter expects. Mirrors
+    mlx_lm's Model.sanitize. No-op for already-stacked checkpoints."""
+    import mlx.core as mx
+    if "model.layers.0.mlp.experts.0.up_proj.weight" not in w:
+        return w
+    for l in range(num_layers):
+        prefix = f"model.layers.{l}"
+        for n in ("up_proj", "down_proj", "gate_proj"):
+            for k in ("weight", "scales", "biases"):
+                if f"{prefix}.mlp.experts.0.{n}.{k}" in w:
+                    joined = [w.pop(f"{prefix}.mlp.experts.{e}.{n}.{k}")
+                              for e in range(num_experts)]
+                    w[f"{prefix}.mlp.switch_mlp.{n}.{k}"] = mx.stack(joined)
+    return w
 
 
 def _free_gb(path):
@@ -336,7 +364,7 @@ def _preprocess(download_dir, output_dir, delete_shards=True, repo=None):
 
         print(f"  Shard {si+1}/{len(ordered)}: {shard_name} "
               f"({_free_gb(download_dir):.1f} GB free)")
-        w = mx.load(sf)
+        w = _stack_experts(mx.load(sf), NUM_LAYERS, NUM_EXPERTS)
 
         shard_pinned = {}
         for k, v in w.items():
@@ -420,7 +448,9 @@ def _preprocess(download_dir, output_dir, delete_shards=True, repo=None):
         "num_experts": tc["num_experts"],
         "num_experts_per_tok": tc["num_experts_per_tok"],
         "shared_expert_intermediate_size": tc.get("shared_expert_intermediate_size"),
-        "moe_intermediate_size": tc["moe_intermediate_size"],
+        # OLMoE-style models size their experts by intermediate_size
+        "moe_intermediate_size": tc.get("moe_intermediate_size",
+                                        tc.get("intermediate_size")),
         "linear_num_value_heads": tc.get("linear_num_value_heads"),
         "linear_num_key_heads": tc.get("linear_num_key_heads"),
         "linear_key_head_dim": tc.get("linear_key_head_dim"),
@@ -435,7 +465,9 @@ def _preprocess(download_dir, output_dir, delete_shards=True, repo=None):
     # persist the source model's real values when present, omit otherwise
     # so the engine-side defaults still apply.
     for key in ("intermediate_size", "norm_topk_prob", "decoder_sparse_step",
-                "mlp_only_layers", "rope_theta"):
+                "mlp_only_layers", "rope_theta",
+                # olmoe-family keys
+                "attention_bias", "mlp_bias", "rope_traditional", "rope_scaling"):
         if tc.get(key) is not None:
             stream_config[key] = tc[key]
     with open(os.path.join(output_dir, "config.json"), "w") as f:

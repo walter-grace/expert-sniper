@@ -98,6 +98,10 @@ def _build_engine(model_dir, cache_size, enable_prediction=True):
         from .engine import MoESniperEngine35B as EngineClass
         from . import engine as engine_mod
         engine_mod.MODEL_DIR = model_dir
+    elif "olmoe" in model_type:
+        from .engine_olmoe import MoESniperEngineOlmoe as EngineClass
+        from . import engine_olmoe as engine_mod
+        engine_mod.MODEL_DIR = model_dir
     else:
         from .engine_30b import MoESniperEngine30B as EngineClass
         from . import engine_30b as engine_mod

@@ -45,6 +45,10 @@ def load_engine(model_dir):
         from . import engine as engine_mod
         engine_mod.MODEL_DIR = model_dir
         from .engine import MoESniperEngine35B as EngineClass
+    elif "olmoe" in model_type:
+        from . import engine_olmoe as engine_mod
+        engine_mod.MODEL_DIR = model_dir
+        from .engine_olmoe import MoESniperEngineOlmoe as EngineClass
     else:
         from . import engine_30b as engine_mod
         engine_mod.MODEL_DIR = model_dir

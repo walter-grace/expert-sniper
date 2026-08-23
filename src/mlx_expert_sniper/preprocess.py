@@ -18,8 +18,8 @@ def preprocess(src_dir, out_dir):
     out_dir = os.path.expanduser(out_dir)
     if not os.path.exists(os.path.join(src_dir, "config.json")):
         raise SystemExit(f"No config.json in {src_dir} — is this an MLX model dir?")
-    if not glob.glob(os.path.join(src_dir, "model-*.safetensors")):
-        raise SystemExit(f"No model-*.safetensors shards in {src_dir}")
+    if not glob.glob(os.path.join(src_dir, "model*.safetensors")):
+        raise SystemExit(f"No model*.safetensors shards in {src_dir}")
 
     from .download import _preprocess
     _preprocess(src_dir, out_dir, delete_shards=False)

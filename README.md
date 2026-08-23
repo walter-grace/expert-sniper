@@ -1,16 +1,34 @@
-# Expert Sniper — Run MoE Models Larger Than Your RAM
+# Expert Sniper — the Expert Network
+
+**Connect ordinary computers into a network that runs MoE models none of them
+could run alone.**
 
 MoE (Mixture-of-Experts) models activate only 8 of 128-256 experts per token,
-so ~97% of the weights are unused per computation. Expert Sniper exploits that
-sparsity on consumer hardware: pin the small always-needed weights
-(attention, norms, router — ~1.4 GB) in RAM, and stream only the active
-experts from SSD with `F_NOCACHE` + `pread`, a right-sized LRU expert cache,
-cross-layer co-activation prefetch, and cache-aware routing bias.
+so ~97% of the weights are unused per computation. That sparsity has a
+consequence most inference stacks ignore: the experts don't have to live on
+the machine doing the thinking. They can live on *any* machine — on its SSD,
+served over the network — because what moves between boxes is activations
+(~4 KB per layer), while what moves within a box is expert weights
+(~13.5 MB per layer). Interconnect is never the bottleneck; pooled SSD
+bandwidth is the resource, and it scales linearly with every machine that
+joins:
 
 ```
-Model on disk: 17-21 GB      RAM pinned: ~0.9-1.4 GB
-The rest streams from SSD on demand.
+feasible when   N x SSD_bandwidth x cache_hit_rate  >  bytes_per_token x target_tok/s
+                └ number of machines in the network
 ```
+
+Expert Sniper builds this in two tiers:
+
+1. **One machine** (`src/mlx_expert_sniper/`): pin the small always-needed
+   weights (attention, norms, router — ~0.9-1.4 GB) in RAM and stream only
+   the active experts from SSD via `F_NOCACHE` + `pread`, with a right-sized
+   LRU expert cache and threaded prefetch. A 17-21 GB model runs in a few GB
+   of RAM.
+2. **A network of machines** (`distributed/`): each node owns a partition of
+   the experts and serves them from its own SSD; a driver runs attention
+   locally and gathers active experts from whichever nodes own them. Every
+   machine added is more expert-cache RAM and more SSD bandwidth.
 
 ## Quick start (Apple Silicon, 16 GB+)
 
@@ -94,9 +112,8 @@ produced no output.
 - `tests/` — unit tests (`python -m pytest tests/`)
 - `RESEARCH.md` — full technical writeup
 
-Multi-Mac distributed expert sharding (pipeline-parallel over 3 Mac Minis)
-exists in the research tree and will be published separately once it's
-hardened for public use.
+- `distributed/` — the Expert Network: expert nodes + distributed driver
+  (see its README for setup)
 
 ## Security notes
 
