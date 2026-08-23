@@ -10,20 +10,16 @@ import json, os, sys, time, platform
 from collections import defaultdict, Counter
 import numpy as np
 
-sys.path.insert(0, os.path.dirname(__file__))
-
 CALIBRATION_PROMPTS = [
     "What is the square root of 69?",
     "Write a Python function to sort a list.",
     "Explain how photosynthesis works.",
 ]
 
-QUALITY_CHECKS = [
-    ("What is the capital of Australia?", "Canberra"),
-    ("What is 2+2?", "4"),
-]
-
 BIAS_VALUES = [0.5, 1.0, 1.5]
+
+# A bias passes if its perplexity stays within this factor of bias=0.
+PPL_TOLERANCE = 1.05
 
 
 def auto_size_cache(model_dir, ram_gb=None):
@@ -60,7 +56,9 @@ def _detect_model_type(model_dir):
     return config.get("model_type", "qwen3_5_moe")
 
 
-def _build_engine(model_dir, cache_size):
+def _build_engine(model_dir, cache_size, enable_prediction=True):
+    # enable_prediction must match what serve/run use (True), or the
+    # calibrated bias is tuned on a different system than the one serving.
     os.environ["TOKENIZERS_PARALLELISM"] = "false"
     model_type = _detect_model_type(model_dir)
     if "gemma4" in model_type:
@@ -79,7 +77,7 @@ def _build_engine(model_dir, cache_size):
         from .engine_30b import MoESniperEngine30B as EngineClass
         from . import engine_30b as engine_mod
         engine_mod.MODEL_DIR = model_dir
-    engine = EngineClass(cache_size=cache_size, enable_prediction=False)
+    engine = EngineClass(cache_size=cache_size, enable_prediction=enable_prediction)
     engine.load()
     return engine
 
@@ -165,6 +163,8 @@ def run_shared_calibration_pass(engine, prompts, tokens_per_prompt=20):
         return engine.model.lm_head(h)
 
     tok = engine.tokenizer
+    from .generate import eos_token_ids
+    eos_ids = eos_token_ids(tok)
     for pi, prompt in enumerate(prompts):
         engine.reset_cache()
         messages = [{"role": "user", "content": prompt}]
@@ -185,7 +185,7 @@ def run_shared_calibration_pass(engine, prompts, tokens_per_prompt=20):
             token = mx.argmax(logits[:, -1, :], axis=-1)
             mx.eval(token)
             tid = token.item()
-            if tid in (248044, 248045): break
+            if tid in eos_ids: break
             logits = instrumented_forward(token.reshape(1, 1))
             mx.eval(logits)
             total_tokens += 1
@@ -203,133 +203,40 @@ def run_shared_calibration_pass(engine, prompts, tokens_per_prompt=20):
     return importance, dead_mask, coact
 
 
-def _generate_with_bias(engine, prompt, bias, max_tokens=40):
-    """Generate with routing bias on raw logits. No REAP masking."""
-    import mlx.core as mx
-    from mlx_lm.models.base import create_attention_mask
-    # Import run_expert_ffn from whichever engine module loaded this engine
-    from .engine import run_expert_ffn
+def sweep_routing_bias(model_dir, cache_size, bias_values=BIAS_VALUES,
+                       eval_text=None, ppl_tolerance=PPL_TOLERANCE):
+    """Perplexity-gated bias sweep.
 
-    has_ssm = hasattr(engine.model.model, 'fa_idx')
-    num_experts_total = 256 if has_ssm else 128  # 35B vs 30B
-
-    engine.reset_cache()
-    tok = engine.tokenizer
-    messages = [{"role": "user", "content": prompt}]
-    try:
-        text = tok.apply_chat_template(messages, tokenize=False,
-                                        add_generation_prompt=True, enable_thinking=False)
-    except:
-        text = tok.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-    tokens = tok.encode(text)
-    input_ids = mx.array([tokens])
-
-    def biased_forward(input_ids):
-        h = engine.model.model.embed_tokens(input_ids)
-        if has_ssm:
-            from mlx_lm.models.base import create_ssm_mask
-            fa_mask = create_attention_mask(h, engine.cache[engine.model.model.fa_idx])
-            ssm_mask = create_ssm_mask(h, engine.cache[engine.model.model.ssm_idx])
-        else:
-            fa_mask = create_attention_mask(h, engine.cache[0])
-            ssm_mask = None
-        for i in range(engine.num_layers):
-            layer = engine.model.model.layers[i]
-            if has_ssm:
-                mask = ssm_mask if layer.is_linear else fa_mask
-            else:
-                mask = fa_mask
-            normed = layer.input_layernorm(h)
-            if has_ssm and layer.is_linear:
-                attn_out = layer.linear_attn(normed, mask=mask, cache=engine.cache[i])
-            else:
-                attn_out = layer.self_attn(normed, mask=mask, cache=engine.cache[i])
-            h = h + attn_out
-            mx.eval(h)
-            normed = layer.post_attention_layernorm(h)
-            raw_logits = layer.mlp.gate(normed)
-            if bias > 0 and engine.reader.lru is not None:
-                cached_mask = np.zeros(num_experts_total, dtype=np.float32)
-                for eid in range(num_experts_total):
-                    if engine.reader.lru.get(i, eid) is not None:
-                        cached_mask[eid] = bias
-                raw_logits = raw_logits + mx.array(cached_mask).reshape(1, -1)
-            gates = mx.softmax(raw_logits, axis=-1, precise=True)
-            k = layer.mlp.top_k
-            inds = mx.argpartition(gates, kth=-k, axis=-1)[..., -k:]
-            scores = mx.take_along_axis(gates, inds, axis=-1)
-            if layer.mlp.norm_topk_prob:
-                scores = scores / scores.sum(axis=-1, keepdims=True)
-            mx.eval(inds, scores)
-            active_ids = list(set(int(e) for e in np.array(inds).flatten()))
-            engine.coact.record_layer(i, active_ids)
-            if engine.coact.ready and i + 1 < engine.num_layers:
-                predicted = engine.coact.predict_next_layer(i, active_ids, top_k=6)
-                if predicted:
-                    to_fetch = [eid for eid in predicted
-                                if engine.reader.lru and engine.reader.lru.get(i+1, eid) is None]
-                    if to_fetch:
-                        engine.reader.prefetch_experts(i+1, to_fetch)
-            if i + 1 < engine.num_layers:
-                engine.reader.prefetch_experts(i+1, active_ids)
-            expert_data = engine.reader.get_experts(i, active_ids)
-            expert_out = run_expert_ffn(normed, expert_data, inds, scores)
-            if hasattr(layer.mlp, 'shared_expert'):
-                shared_out = layer.mlp.shared_expert(normed)
-                shared_gate = mx.sigmoid(layer.mlp.shared_expert_gate(normed))
-                if shared_gate.ndim < shared_out.ndim:
-                    shared_gate = shared_gate[..., None]
-                expert_out = expert_out + shared_gate * shared_out
-            h = h + expert_out
-            mx.eval(h)
-            del expert_data, expert_out, normed, attn_out
-            mx.clear_cache()
-        engine.coact.end_token()
-        h = engine.model.model.norm(h)
-        return engine.model.lm_head(h)
-
-    logits = biased_forward(input_ids)
-    mx.eval(logits)
-    generated = []
-    for _ in range(max_tokens):
-        token = mx.argmax(logits[:, -1, :], axis=-1)
-        mx.eval(token)
-        tid = token.item()
-        if tid in (248044, 248045): break
-        generated.append(tid)
-        logits = biased_forward(token.reshape(1, 1))
-        mx.eval(logits)
-    return generated, tok.decode(generated)
-
-
-def sweep_routing_bias(model_dir, cache_size, reap_mask, coact_matrix,
-                       bias_values=BIAS_VALUES):
-    """Find highest bias where quality checks pass. No REAP during sweep."""
+    Measures teacher-forced perplexity at bias=0 (baseline) and at each
+    candidate bias, on an engine configured exactly as serve/run configure
+    it (co-activation prediction ON). Returns the highest bias whose
+    perplexity stays within ppl_tolerance of baseline, plus all results.
+    """
     import mlx.core as mx, gc
+    from .evaluate import perplexity
+    from .generate import generate_stream
 
-    best_bias = 0.0
-    for bias in bias_values:
-        print(f"  Testing bias={bias}...", end=" ", flush=True)
-        engine = _build_engine(model_dir, cache_size)
-        engine._enable_prediction = True
+    results = {}
+    for bias in [0.0] + list(bias_values):
+        print(f"  Measuring ppl at bias={bias}...", end=" ", flush=True)
+        engine = _build_engine(model_dir, cache_size, enable_prediction=True)
+        try:
+            results[bias] = perplexity(engine, bias=bias)
+            print(f"ppl={results[bias]:.3f}")
+            # One qualitative generation per bias — eyeball only, not a gate.
+            sample = "".join(generate_stream(
+                engine, [{"role": "user", "content": "Briefly explain what a mixture-of-experts model is."}],
+                bias=bias, max_tokens=40))
+            print(f"    sample: {sample[:100]!r}")
+        finally:
+            engine.reader.close()
+            del engine; gc.collect(); mx.clear_cache()
 
-        all_pass = True
-        for prompt, expected in QUALITY_CHECKS:
-            _, output = _generate_with_bias(engine, prompt, bias, max_tokens=40)
-            if expected.lower() not in output.lower():
-                print(f"FAIL ('{expected}' not in: '{output[:60]}')")
-                all_pass = False
-                break
-
-        if all_pass:
-            print("PASS")
-            best_bias = bias
-        else:
-            break
-
-        del engine; gc.collect(); mx.clear_cache()
-
-    return best_bias
+    baseline = results[0.0]
+    passing = [b for b in bias_values
+               if results.get(b) is not None and results[b] <= baseline * ppl_tolerance]
+    best = max(passing) if passing else 0.0
+    return best, results
 
 
 def calibrate(model_dir, ram_gb=None, quick=False):
@@ -355,14 +262,19 @@ def calibrate(model_dir, ram_gb=None, quick=False):
     dead_pct = np.mean(dead_mask)
     print(f"  Dead experts: {np.sum(dead_mask)}/{dead_mask.size} ({dead_pct:.1%})")
 
+    engine.reader.close()
     del engine; gc.collect(); mx.clear_cache()
 
     if quick:
         best_bias = 0.5
+        bias_sweep_ppl = None
         print(f"\nStep 3: Bias sweep (skipped — quick mode, using {best_bias})")
+        print("  WARNING: bias not validated — run full calibrate before "
+              "trusting quality at this bias.")
     else:
-        print(f"\nStep 3: Routing bias sweep {BIAS_VALUES}")
-        best_bias = sweep_routing_bias(model_dir, cache_size, dead_mask, coact_cross)
+        print(f"\nStep 3: Routing bias sweep {BIAS_VALUES} "
+              f"(perplexity gate, tolerance {PPL_TOLERANCE}x)")
+        best_bias, bias_sweep_ppl = sweep_routing_bias(model_dir, cache_size)
         print(f"  Sweet spot: {best_bias}")
 
     config = {
@@ -376,6 +288,9 @@ def calibrate(model_dir, ram_gb=None, quick=False):
         },
         "cache_size": cache_size,
         "routing_bias": best_bias,
+        "bias_sweep_ppl": ({str(k): round(v, 4) for k, v in bias_sweep_ppl.items()}
+                           if bias_sweep_ppl else None),
+        "ppl_tolerance": PPL_TOLERANCE,
         "reap_threshold": 0.01,
         "reap_dead_pct": float(dead_pct),
         "coact_warmup_tokens": 3,

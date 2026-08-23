@@ -21,3 +21,6 @@ mlx-sniper = "mlx_expert_sniper.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.package-data]
+mlx_expert_sniper = ["data/*.txt"]

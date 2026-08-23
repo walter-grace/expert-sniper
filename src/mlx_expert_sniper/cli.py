@@ -7,6 +7,7 @@ Usage:
     mlx-sniper run <model-dir> -p "prompt" [-v] [--max-tokens N]
     mlx-sniper chat <model-dir> [--max-tokens 500]
     mlx-sniper serve <model-dir> [--port 11434] [--host 127.0.0.1]
+    mlx-sniper eval <model-dir> [--bias N] [--text FILE] [--chunks N]
 """
 import argparse
 import sys
@@ -170,6 +171,17 @@ def cmd_chat(args):
         messages.append({"role": "assistant", "content": full_response})
 
 
+def cmd_eval(args):
+    from .evaluate import evaluate_model
+    evaluate_model(
+        args.model_dir,
+        bias=args.bias,  # None = use calibrated bias
+        text_path=args.text,
+        seq_len=args.seq_len,
+        max_chunks=args.chunks,
+    )
+
+
 def main():
     parser = argparse.ArgumentParser(
         prog="mlx-sniper",
@@ -209,6 +221,15 @@ def main():
     p.add_argument("model_dir", help="Path to sniper model directory")
     p.add_argument("--max-tokens", type=int, default=500)
 
+    # eval
+    p = sub.add_parser("eval", help="Teacher-forced perplexity on held-out text")
+    p.add_argument("model_dir", help="Path to sniper model directory")
+    p.add_argument("--bias", type=float, default=None,
+                   help="Routing bias (default: calibrated bias)")
+    p.add_argument("--text", default=None, help="Eval text file (default: bundled)")
+    p.add_argument("--seq-len", type=int, default=512)
+    p.add_argument("--chunks", type=int, default=8)
+
     args = parser.parse_args()
     if args.command is None:
         parser.print_help()
@@ -220,6 +241,7 @@ def main():
         "calibrate": cmd_calibrate,
         "run": cmd_run,
         "chat": cmd_chat,
+        "eval": cmd_eval,
     }
     cmds[args.command](args)
 

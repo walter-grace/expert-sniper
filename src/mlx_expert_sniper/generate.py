@@ -55,32 +55,17 @@ def load_engine(model_dir):
     return eng, bias, model_type
 
 
-def generate_stream(engine, messages, bias=0.0, max_tokens=200):
-    """Generator yielding token strings. Handles Qwen + Gemma 4 architectures."""
+def make_forward(engine, bias=0.0):
+    """Build the streaming forward pass for Qwen-family engines: cache-aware
+    routing bias, co-activation prefetch, expert streaming. This is the SAME
+    configuration serve/run use — calibration and eval must call it too, so
+    measured numbers describe the system that actually serves."""
     import mlx.core as mx
     from mlx_lm.models.base import create_attention_mask
-
-    # Detect model type — Gemma 4 uses its own forward pass
-    is_gemma4 = hasattr(engine, 'per_expert_scales')  # Gemma 4 engine has this
-    if is_gemma4:
-        return _generate_stream_gemma4(engine, messages, max_tokens)
-
     from .engine import run_expert_ffn
+
     has_ssm = hasattr(engine.model.model, 'fa_idx')
     num_experts = engine.num_experts
-
-    engine.reset_cache()
-    tok = engine.tokenizer
-    try:
-        text = tok.apply_chat_template(messages, tokenize=False,
-                                        add_generation_prompt=True, enable_thinking=False)
-    except Exception:
-        try:
-            text = tok.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-        except Exception:
-            text = messages[-1]["content"]
-    tokens = tok.encode(text)
-    input_ids = mx.array([tokens])
 
     def forward(inp):
         h = engine.model.model.embed_tokens(inp)
@@ -154,6 +139,32 @@ def generate_stream(engine, messages, bias=0.0, max_tokens=200):
         h = engine.model.model.norm(h)
         return engine.model.lm_head(h)
 
+    return forward
+
+
+def generate_stream(engine, messages, bias=0.0, max_tokens=200):
+    """Generator yielding token strings. Handles Qwen + Gemma 4 architectures."""
+    import mlx.core as mx
+
+    # Detect model type — Gemma 4 uses its own forward pass
+    is_gemma4 = hasattr(engine, 'per_expert_scales')  # Gemma 4 engine has this
+    if is_gemma4:
+        return _generate_stream_gemma4(engine, messages, max_tokens)
+
+    engine.reset_cache()
+    tok = engine.tokenizer
+    try:
+        text = tok.apply_chat_template(messages, tokenize=False,
+                                        add_generation_prompt=True, enable_thinking=False)
+    except Exception:
+        try:
+            text = tok.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+        except Exception:
+            text = messages[-1]["content"]
+    tokens = tok.encode(text)
+    input_ids = mx.array([tokens])
+
+    forward = make_forward(engine, bias=bias)
     logits = forward(input_ids)
     mx.eval(logits)
 
