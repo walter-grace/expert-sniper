@@ -15,12 +15,18 @@ DEFAULT_TEXT = os.path.join(os.path.dirname(__file__), "data", "eval_text.txt")
 
 
 def perplexity(engine, bias=0.0, text_path=None, seq_len=512, max_chunks=8,
-               verbose=False):
+               verbose=False, mode="prefill"):
     """Teacher-forced perplexity over held-out text.
 
-    Splits the corpus into `max_chunks` sequences of `seq_len` tokens; each
-    chunk is one prefill forward. Returns exp(mean NLL) over all predicted
-    positions.
+    mode="prefill": each chunk is one batched prefill forward (fast). Note
+    that during prefill the expert cache covers few experts, so a routing
+    bias barely engages — this mode measures baseline quality well but can
+    UNDERSTATE the impact of a bias.
+    mode="decode": token-by-token teacher forcing with a growing KV cache —
+    the cache-aware bias engages exactly as it does when serving. ~seq_len
+    times slower per chunk; use fewer/shorter chunks.
+
+    Returns exp(mean NLL) over all predicted positions.
     """
     import mlx.core as mx
 
@@ -50,20 +56,30 @@ def perplexity(engine, bias=0.0, text_path=None, seq_len=512, max_chunks=8,
     total_count = 0
     for ci, chunk in enumerate(chunks):
         engine.reset_cache()
-        input_ids = mx.array([chunk])
-        logits = forward(input_ids)  # [1, seq_len, vocab]
-        x = logits[0, :-1].astype(mx.float32)
-        logprobs = x - mx.logsumexp(x, axis=-1, keepdims=True)
-        targets = mx.array(chunk[1:]).reshape(-1, 1)
-        nll = -mx.take_along_axis(logprobs, targets, axis=-1)
-        chunk_nll = float(mx.sum(nll))
+        if mode == "decode":
+            chunk_nll = 0.0
+            for t in range(len(chunk) - 1):
+                logits = forward(mx.array([[chunk[t]]]))
+                x = logits[0, -1].astype(mx.float32)
+                lse = mx.logsumexp(x)
+                chunk_nll += float(lse - x[chunk[t + 1]])
+                del logits
+            mx.clear_cache()
+        else:
+            input_ids = mx.array([chunk])
+            logits = forward(input_ids)  # [1, seq_len, vocab]
+            x = logits[0, :-1].astype(mx.float32)
+            logprobs = x - mx.logsumexp(x, axis=-1, keepdims=True)
+            targets = mx.array(chunk[1:]).reshape(-1, 1)
+            nll = -mx.take_along_axis(logprobs, targets, axis=-1)
+            chunk_nll = float(mx.sum(nll))
+            del logits, logprobs, nll
+            mx.clear_cache()
         total_nll += chunk_nll
         total_count += len(chunk) - 1
         if verbose:
             print(f"  chunk {ci + 1}/{len(chunks)}: "
                   f"ppl={math.exp(chunk_nll / (len(chunk) - 1)):.2f}")
-        del logits, logprobs, nll
-        mx.clear_cache()
 
     return math.exp(total_nll / total_count)
 
