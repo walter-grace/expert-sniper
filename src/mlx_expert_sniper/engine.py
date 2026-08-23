@@ -91,21 +91,32 @@ class MoESniperEngine35B:
 
         self.model = TextModel(args)
         from mlx_lm.models.switch_layers import SwitchLinear
-        SSM_PROTECT = {"conv1d"}
-        def should_quantize(path, module):
-            if isinstance(module, nn.Embedding): return True
-            if isinstance(module, SwitchLinear): return True
-            if not isinstance(module, nn.Linear): return False
-            if any(k in path for k in SSM_PROTECT): return False
-            if module.weight.shape[-1] < GROUP_SIZE: return False
-            return True
-        nn.quantize(self.model, group_size=GROUP_SIZE, bits=BITS, class_predicate=should_quantize)
 
         mx.set_memory_limit(14 * 1024**3)
         mx.set_cache_limit(512 * 1024**2)
 
         pinned = mx.load(os.path.join(MODEL_DIR, "pinned.safetensors"))
         stripped = [(k.replace("language_model.", "", 1), v) for k, v in pinned.items()]
+
+        # Quantize per the CHECKPOINT's recipe (see engine_30b for why):
+        # per-module overrides from config, scales-membership for the rest.
+        # This also protects SSM conv1d etc. automatically — unquantized
+        # modules ship no scales.
+        qcfg = dict(config.get("quantization") or {})
+        q_group = qcfg.pop("group_size", GROUP_SIZE)
+        q_bits = qcfg.pop("bits", BITS)
+        pinned_keys = {k for k, _ in stripped}
+        def should_quantize(path, module):
+            if path in qcfg:
+                return qcfg[path]
+            if isinstance(module, SwitchLinear):
+                return True
+            if isinstance(module, (nn.Linear, nn.Embedding)):
+                return f"{path}.scales" in pinned_keys
+            return False
+        nn.quantize(self.model, group_size=q_group, bits=q_bits,
+                    class_predicate=should_quantize)
+
         self.model.load_weights(stripped, strict=False)
         params = [p for name, p in tree_flatten(self.model.parameters()) if "switch_mlp" not in name]
         mx.eval(*params)

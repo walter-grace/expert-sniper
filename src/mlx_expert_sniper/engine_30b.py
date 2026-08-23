@@ -88,18 +88,33 @@ class MoESniperEngine30B:
 
         self.model = Model(args)
         from mlx_lm.models.switch_layers import SwitchLinear
-        model_pred = self.model.quant_predicate
-        def should_quantize(path, module):
-            if isinstance(module, nn.Embedding): return True
-            if isinstance(module, SwitchLinear): return True
-            if not isinstance(module, nn.Linear): return False
-            return model_pred(path, module)
-        nn.quantize(self.model, group_size=GROUP_SIZE, bits=BITS, class_predicate=should_quantize)
 
         mx.set_memory_limit(14 * 1024**3)
         mx.set_cache_limit(512 * 1024**2)
 
         pinned = mx.load(f"{MODEL_DIR}/pinned.safetensors")
+
+        # Quantize per the CHECKPOINT's recipe, not the current mlx_lm
+        # conversion recipe: honor per-module overrides from the config's
+        # quantization dict, and quantize a pinned module only if the
+        # checkpoint actually shipped scales for it. (The conversion-time
+        # quant_predicate says e.g. "gate at 8-bit" for checkpoints newer
+        # than this one and crashes on older uniform-4-bit checkpoints.)
+        qcfg = dict(config.get("quantization") or {})
+        q_group = qcfg.pop("group_size", GROUP_SIZE)
+        q_bits = qcfg.pop("bits", BITS)
+        pinned_keys = set(pinned.keys())
+        def should_quantize(path, module):
+            if path in qcfg:
+                return qcfg[path]  # per-module override from the checkpoint
+            if isinstance(module, SwitchLinear):
+                return True  # expert weights are streamed, always quantized
+            if isinstance(module, (nn.Linear, nn.Embedding)):
+                return f"{path}.scales" in pinned_keys
+            return False
+        nn.quantize(self.model, group_size=q_group, bits=q_bits,
+                    class_predicate=should_quantize)
+
         self.model.load_weights(list(pinned.items()), strict=False)
         params = [p for name, p in tree_flatten(self.model.parameters()) if "switch_mlp" not in name]
         mx.eval(*params)
