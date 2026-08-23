@@ -155,8 +155,78 @@ def download_model(model_name, output_dir=None, calibrate_quick=True, keep_downl
     return True
 
 
-def _preprocess(download_dir, output_dir):
-    """Split MLX 4-bit model into pinned + streaming experts."""
+def _tensor_bytes(expert_t):
+    import mlx.core as mx
+    mx.eval(expert_t)
+    if expert_t.dtype == mx.bfloat16:
+        return np.array(expert_t.view(mx.uint16)).tobytes()
+    return np.array(expert_t).tobytes()
+
+
+def _write_layer(output_dir, layer_idx, lt, num_experts, verify=True):
+    """Write one layer's experts as a 16KB-header + fixed-block .bin file.
+
+    With verify=True, re-reads two random expert blocks from disk and
+    byte-compares them against the source tensors — the only moment this
+    check is possible, since source shards are deleted right after.
+    Returns bytes written.
+    """
+    tensor_info = {}
+    offset = 0
+    for tname in TENSOR_ORDER:
+        t = lt[tname]
+        per_expert_shape = list(t.shape[1:])
+        per_expert_bytes = int(np.prod(per_expert_shape)) * t.dtype.size
+        tensor_info[tname] = {
+            "inner_offset": offset, "nbytes": per_expert_bytes,
+            "shape_per_expert": per_expert_shape, "dtype": str(t.dtype),
+        }
+        offset += per_expert_bytes
+    expert_block_size = ((offset + PAGE_SIZE - 1) // PAGE_SIZE) * PAGE_SIZE
+
+    header = {"layer_idx": layer_idx, "num_experts": num_experts,
+              "layout": {"expert_block_size": expert_block_size,
+                         "data_start": PAGE_SIZE, "tensors": tensor_info}}
+    header_json = json.dumps(header).encode()
+    header_padded = header_json + b"\x00" * (PAGE_SIZE - len(header_json))
+
+    layer_path = os.path.join(output_dir, "bin", f"moe_layer_{layer_idx:02d}.bin")
+    layer_bytes = PAGE_SIZE
+    with open(layer_path, "wb") as f:
+        f.write(header_padded)
+        for eid in range(num_experts):
+            expert_data = bytearray()
+            for tname in TENSOR_ORDER:
+                expert_data.extend(_tensor_bytes(lt[tname][eid]))
+            pad = expert_block_size - len(expert_data)
+            if pad > 0:
+                expert_data.extend(b"\x00" * pad)
+            f.write(bytes(expert_data))
+            layer_bytes += expert_block_size
+
+    if verify:
+        import random
+        with open(layer_path, "rb") as f:
+            for eid in random.sample(range(num_experts), min(2, num_experts)):
+                f.seek(PAGE_SIZE + eid * expert_block_size)
+                on_disk = f.read(expert_block_size)
+                expected = bytearray()
+                for tname in TENSOR_ORDER:
+                    expected.extend(_tensor_bytes(lt[tname][eid]))
+                if on_disk[:len(expected)] != bytes(expected):
+                    raise RuntimeError(
+                        f"verify FAILED: layer {layer_idx} expert {eid} "
+                        f"on-disk bytes differ from source tensors")
+
+    return layer_bytes
+
+
+def _preprocess(download_dir, output_dir, delete_shards=True):
+    """Split MLX 4-bit model into pinned + streaming experts.
+
+    delete_shards=True frees disk as it goes (download flow); pass False
+    when preprocessing a checkpoint the user supplied themselves.
+    """
     import mlx.core as mx
 
     os.makedirs(output_dir, exist_ok=True)
@@ -200,45 +270,7 @@ def _preprocess(download_dir, output_dir):
                 continue
 
             lt = expert_keys[layer_idx]
-            tensor_info = {}
-            offset = 0
-            for tname in TENSOR_ORDER:
-                t = lt[tname]
-                per_expert_shape = list(t.shape[1:])
-                per_expert_bytes = int(np.prod(per_expert_shape)) * t.dtype.size
-                tensor_info[tname] = {
-                    "inner_offset": offset, "nbytes": per_expert_bytes,
-                    "shape_per_expert": per_expert_shape, "dtype": str(t.dtype),
-                }
-                offset += per_expert_bytes
-            expert_block_size = ((offset + PAGE_SIZE - 1) // PAGE_SIZE) * PAGE_SIZE
-
-            header = {"layer_idx": layer_idx, "num_experts": NUM_EXPERTS,
-                      "layout": {"expert_block_size": expert_block_size,
-                                 "data_start": PAGE_SIZE, "tensors": tensor_info}}
-            header_json = json.dumps(header).encode()
-            header_padded = header_json + b"\x00" * (PAGE_SIZE - len(header_json))
-
-            layer_path = os.path.join(output_dir, "bin", f"moe_layer_{layer_idx:02d}.bin")
-            layer_bytes = PAGE_SIZE
-            with open(layer_path, "wb") as f:
-                f.write(header_padded)
-                for eid in range(NUM_EXPERTS):
-                    expert_data = bytearray()
-                    for tname in TENSOR_ORDER:
-                        expert_t = lt[tname][eid]
-                        mx.eval(expert_t)
-                        if expert_t.dtype == mx.bfloat16:
-                            raw = np.array(expert_t.view(mx.uint16)).tobytes()
-                        else:
-                            raw = np.array(expert_t).tobytes()
-                        expert_data.extend(raw)
-                    pad = expert_block_size - len(expert_data)
-                    if pad > 0:
-                        expert_data.extend(b"\x00" * pad)
-                    f.write(bytes(expert_data))
-                    layer_bytes += expert_block_size
-
+            layer_bytes = _write_layer(output_dir, layer_idx, lt, NUM_EXPERTS)
             total_expert_bytes += layer_bytes
             expert_layers_done.add(layer_idx)
             del expert_keys[layer_idx]
@@ -246,8 +278,9 @@ def _preprocess(download_dir, output_dir):
             print(f"    Layer {layer_idx:2d}/{NUM_LAYERS}: {layer_bytes/1e6:.1f} MB ({elapsed:.0f}s)")
 
         del w; gc.collect()
-        os.remove(sf)
-        print(f"    Deleted {shard_name} to free disk")
+        if delete_shards:
+            os.remove(sf)
+            print(f"    Deleted {shard_name} to free disk")
 
     # Handle any layers split across shards (incomplete after last shard)
     for layer_idx in sorted(expert_keys.keys()):
@@ -257,44 +290,7 @@ def _preprocess(download_dir, output_dir):
         if len(lt) < len(TENSOR_ORDER):
             print(f"  WARNING: Layer {layer_idx} incomplete ({len(lt)}/{len(TENSOR_ORDER)} tensors)")
             continue
-        # Same write logic as above
-        tensor_info = {}
-        offset = 0
-        for tname in TENSOR_ORDER:
-            t = lt[tname]
-            per_expert_shape = list(t.shape[1:])
-            per_expert_bytes = int(np.prod(per_expert_shape)) * t.dtype.size
-            tensor_info[tname] = {
-                "inner_offset": offset, "nbytes": per_expert_bytes,
-                "shape_per_expert": per_expert_shape, "dtype": str(t.dtype),
-            }
-            offset += per_expert_bytes
-        expert_block_size = ((offset + PAGE_SIZE - 1) // PAGE_SIZE) * PAGE_SIZE
-        header = {"layer_idx": layer_idx, "num_experts": NUM_EXPERTS,
-                  "layout": {"expert_block_size": expert_block_size,
-                             "data_start": PAGE_SIZE, "tensors": tensor_info}}
-        header_json = json.dumps(header).encode()
-        header_padded = header_json + b"\x00" * (PAGE_SIZE - len(header_json))
-        layer_path = os.path.join(output_dir, "bin", f"moe_layer_{layer_idx:02d}.bin")
-        layer_bytes = PAGE_SIZE
-        import mlx.core as mx
-        with open(layer_path, "wb") as f:
-            f.write(header_padded)
-            for eid in range(NUM_EXPERTS):
-                ed = bytearray()
-                for tname in TENSOR_ORDER:
-                    expert_t = lt[tname][eid]
-                    mx.eval(expert_t)
-                    if expert_t.dtype == mx.bfloat16:
-                        raw = np.array(expert_t.view(mx.uint16)).tobytes()
-                    else:
-                        raw = np.array(expert_t).tobytes()
-                    ed.extend(raw)
-                pad = expert_block_size - len(ed)
-                if pad > 0:
-                    ed.extend(b"\x00" * pad)
-                f.write(bytes(ed))
-                layer_bytes += expert_block_size
+        layer_bytes = _write_layer(output_dir, layer_idx, lt, NUM_EXPERTS)
         total_expert_bytes += layer_bytes
         print(f"    Layer {layer_idx:2d}/{NUM_LAYERS}: {layer_bytes/1e6:.1f} MB (cross-shard)")
 
@@ -338,6 +334,13 @@ def _preprocess(download_dir, output_dir):
         "quantization": config.get("quantization", {"bits": 4, "group_size": 64}),
         "streaming": {"pinned_file": "pinned.safetensors", "expert_dir": "bin"},
     }
+    # qwen3_moe-family keys (engine_30b reads these with .get defaults):
+    # persist the source model's real values when present, omit otherwise
+    # so the engine-side defaults still apply.
+    for key in ("intermediate_size", "norm_topk_prob", "decoder_sparse_step",
+                "mlp_only_layers", "rope_theta"):
+        if tc.get(key) is not None:
+            stream_config[key] = tc[key]
     with open(os.path.join(output_dir, "config.json"), "w") as f:
         json.dump(stream_config, f, indent=2)
 

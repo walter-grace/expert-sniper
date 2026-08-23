@@ -171,6 +171,11 @@ def cmd_chat(args):
         messages.append({"role": "assistant", "content": full_response})
 
 
+def cmd_preprocess(args):
+    from .preprocess import preprocess
+    preprocess(args.src_dir, args.out_dir)
+
+
 def cmd_eval(args):
     from .evaluate import evaluate_model
     evaluate_model(
@@ -221,6 +226,11 @@ def main():
     p.add_argument("model_dir", help="Path to sniper model directory")
     p.add_argument("--max-tokens", type=int, default=500)
 
+    # preprocess
+    p = sub.add_parser("preprocess", help="Split a downloaded MLX model into streaming format")
+    p.add_argument("src_dir", help="Downloaded MLX model directory")
+    p.add_argument("out_dir", help="Output streaming-format directory")
+
     # eval
     p = sub.add_parser("eval", help="Teacher-forced perplexity on held-out text")
     p.add_argument("model_dir", help="Path to sniper model directory")
@@ -242,6 +252,7 @@ def main():
         "run": cmd_run,
         "chat": cmd_chat,
         "eval": cmd_eval,
+        "preprocess": cmd_preprocess,
     }
     cmds[args.command](args)
 
