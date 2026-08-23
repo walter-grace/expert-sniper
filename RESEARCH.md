@@ -205,6 +205,34 @@ referenced — the "download → split → delete" pipeline could fill the disk
 while apparently deleting as it went. v0.2 persists pinned tensors per shard
 and round-trips cross-shard tensors through a carry file before deletion.
 
+## v0.3: The Expert Network (2026-08-24)
+
+The distributed tier was rebuilt on the corrected single-machine core: nodes
+serve expert partitions over a binary HTTP protocol, the driver runs
+attention/routing locally, and the SAME forward pass as single-machine
+serving drives the network through a remote-compute hook — so every
+measurement and fix applies to both tiers. Partition assignment is
+rendezvous hashing over a shared node roster: all nodes derive identical
+assignments with no coordination, and membership change moves ~1/N of
+experts.
+
+Measured (two nodes + driver on one M4 Mac Mini, OLMoE-1B-7B, 64 experts
+split 32/32): **19.3 tok/s, TTFT 0.6 s, 2.9 ms/layer round trip, ~0.24 MB
+network traffic per token** — vs 14.9 tok/s for the same model streaming
+from SSD on the same machine. Resident partitions remove the SSD from the
+token loop; the traffic numbers confirm the activation-vs-expert-bytes
+analysis below (what crosses the network is 3 orders of magnitude smaller
+than what would have crossed the SSD).
+
+Single-machine prefetch also changed in v0.3: co-activation prediction
+(bandwidth-neutral, see v0.2 findings) was replaced by early-router
+prediction — layer i+1's pinned router applied to layer i's hidden state
+(the residual stream barely rotates between layers; 83.8% recall@8 / 97.0%
+recall@16 measured at d=1 on OLMoE) — with speculative reads parked in a
+victim buffer and promoted only on demand use (naive promotion measurably
+polluted the cache: 17.4 -> 10.8 tok/s in the lab that produced these
+numbers).
+
 ## Honest Results: Three-Way A/B Test
 
 ### llama.cpp Expert Memory Management (clean A/B on same hardware)

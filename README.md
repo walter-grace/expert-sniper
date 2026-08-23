@@ -25,10 +25,35 @@ Expert Sniper builds this in two tiers:
    the active experts from SSD via `F_NOCACHE` + `pread`, with a right-sized
    LRU expert cache and threaded prefetch. A 17-21 GB model runs in a few GB
    of RAM.
-2. **A network of machines** (`distributed/`): each node owns a partition of
-   the experts and serves them from its own SSD; a driver runs attention
-   locally and gathers active experts from whichever nodes own them. Every
-   machine added is more expert-cache RAM and more SSD bandwidth.
+2. **A network of machines** (`src/expert_network/`): each node owns a
+   partition of the experts, loaded from its own SSD into its own RAM; a
+   driver runs attention locally and dispatches expert compute to whichever
+   nodes own the active experts. Every machine added is more expert RAM and
+   more SSD bandwidth. Partition assignment is rendezvous hashing over a
+   shared node roster — every node derives the same assignment with zero
+   coordination, and adding a node moves only ~1/N of the experts.
+
+Measured, two nodes + driver (localhost, OLMoE-1B-7B, 64 experts split
+32/32 by roster): **19.3 tok/s, TTFT 0.6 s, 2.9 ms/layer round trip,
+~0.24 MB of network traffic per token** — faster than the same model
+streaming from SSD on one machine (14.9 tok/s), because resident partitions
+take the SSD out of the token loop entirely.
+
+```bash
+pip install -e ".[network]"
+mlx-sniper download olmoe-1b-7b -o ~/models/olmoe-stream   # 3.6 GB demo model
+
+# each machine (or terminal) derives its partition from the shared roster:
+expert-node --model-dir ~/models/olmoe-stream --roster mini-a,mini-b --me mini-a --port 8301
+expert-node --model-dir ~/models/olmoe-stream --roster mini-a,mini-b --me mini-b --port 8302
+
+expert-net ~/models/olmoe-stream --nodes http://127.0.0.1:8301,http://127.0.0.1:8302 --chat
+```
+
+Nodes bind `127.0.0.1` by default and have no authentication — pass
+`--host 0.0.0.0` only on a trusted network. The decode loop is a LAN/metro
+design (per-layer round trips); the WAN's role is distributing the
+content-addressed expert partitions, never the token loop.
 
 ## Quick start (Apple Silicon, 16 GB+)
 
@@ -74,6 +99,13 @@ decode-mode perplexity on held-out text:
 
 TTFT ~11 s; sustained SSD streaming 1.7–2.3 GB/s at 1.2–1.9 ms/expert.
 
+OLMoE-1B-7B (3.6 GB, 64 experts — the demo model), same machine:
+**14.9 tok/s single-machine streaming** (85% hit rate, TTFT 1.3 s) and
+**19.3 tok/s as a two-node Expert Network**. Prefetch is early-router
+prediction (layer *i+1*'s pinned router run on layer *i*'s hidden state —
+97% recall@16 measured), with speculative reads parked in a victim buffer
+and promoted to the main cache only when a demand uses them.
+
 Three honest findings from re-measuring on the fixed code (details in
 RESEARCH.md):
 
@@ -112,8 +144,8 @@ produced no output.
 - `tests/` — unit tests (`python -m pytest tests/`)
 - `RESEARCH.md` — full technical writeup
 
-- `distributed/` — the Expert Network: expert nodes + distributed driver
-  (see its README for setup)
+- `src/expert_network/` — the Expert Network: nodes, binary protocol,
+  distributed driver, HRW roster placement
 
 ## Security notes
 
