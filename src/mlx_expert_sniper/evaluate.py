@@ -52,7 +52,8 @@ def perplexity(engine, bias=0.0, text_path=None, seq_len=512, max_chunks=8,
         engine.reset_cache()
         input_ids = mx.array([chunk])
         logits = forward(input_ids)  # [1, seq_len, vocab]
-        logprobs = mx.log_softmax(logits[0, :-1].astype(mx.float32), axis=-1)
+        x = logits[0, :-1].astype(mx.float32)
+        logprobs = x - mx.logsumexp(x, axis=-1, keepdims=True)
         targets = mx.array(chunk[1:]).reshape(-1, 1)
         nll = -mx.take_along_axis(logprobs, targets, axis=-1)
         chunk_nll = float(mx.sum(nll))
