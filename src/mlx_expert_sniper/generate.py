@@ -4,6 +4,11 @@ import numpy as np
 
 STOP_TOKENS = {"<|im_end|>", "<|endoftext|>", "<|im_start|>"}
 
+# Early-router prefetch margin: predicted-and-missing experts fetched per
+# layer. The OLMoE lab measured M=16 fetching ~2x needed bytes (prefetch
+# HURT in bandwidth-bound regimes); M=10 buys ~85% coverage at ~1.2x bytes.
+PREFETCH_M = 10
+
 
 def eos_token_ids(tok):
     """EOS ids derived from the tokenizer (models disagree on the ids)."""
@@ -70,6 +75,7 @@ def make_forward(engine, bias=0.0):
 
     has_ssm = hasattr(engine.model.model, 'fa_idx')
     num_experts = engine.num_experts
+    predictor = getattr(engine, "predictor", "router")
 
     def forward(inp):
         h = engine.model.model.embed_tokens(inp)
@@ -114,15 +120,30 @@ def make_forward(engine, bias=0.0):
 
             active_ids = list(set(int(e) for e in np.array(inds).flatten()))
             engine.coact.record_layer(i, active_ids)
-            if engine.coact.ready and i + 1 < engine.num_layers:
-                predicted = engine.coact.predict_next_layer(i, active_ids, top_k=6)
-                if predicted:
-                    to_fetch = [eid for eid in predicted
-                                if engine.reader.lru and not engine.reader.lru.contains(i+1, eid)]
-                    if to_fetch:
-                        engine.reader.prefetch_experts(i+1, to_fetch)
             if i + 1 < engine.num_layers:
-                engine.reader.prefetch_experts(i+1, active_ids)
+                nxt = engine.model.model.layers[i + 1]
+                if predictor == "router" and hasattr(nxt.mlp, "gate"):
+                    # Early-router prefetch: the residual stream barely
+                    # rotates between layers, so running layer i+1's router
+                    # on layer i's hidden state predicts its top-8 with
+                    # ~84% recall at top-8 and ~97% at top-16 (measured on
+                    # OLMoE; d=1). Strictly better per byte than both the
+                    # co-activation matrix and the active-ids heuristic.
+                    pl = nxt.mlp.gate(normed)
+                    pm = mx.argpartition(pl, kth=-PREFETCH_M, axis=-1)[..., -PREFETCH_M:]
+                    mx.eval(pm)
+                    predicted = list(set(int(v) for v in np.array(pm).flatten()))
+                    engine.reader.prefetch_experts(i + 1, predicted)
+                else:
+                    # legacy: co-activation matrix + previous-layer actives
+                    if engine.coact.ready:
+                        predicted = engine.coact.predict_next_layer(i, active_ids, top_k=6)
+                        if predicted:
+                            to_fetch = [eid for eid in predicted
+                                        if engine.reader.lru and not engine.reader.lru.contains(i+1, eid)]
+                            if to_fetch:
+                                engine.reader.prefetch_experts(i+1, to_fetch)
+                    engine.reader.prefetch_experts(i+1, active_ids)
 
             expert_data = engine.reader.get_experts(i, active_ids)
             expert_out = run_expert_ffn(normed, expert_data, inds, scores)

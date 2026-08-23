@@ -305,6 +305,16 @@ class MoEExpertReader:
         # (prefetch_experts / get_experts) — no lock needed.
         self.prefetch_futures = {}
 
+        # Victim buffer for speculative reads. Promoting every completed
+        # prefetch straight into the main LRU pollutes it — each speculative
+        # insert evicts a demand-proven expert (measured on the OLMoE lab:
+        # naive promotion cut 17.4 tok/s to 10.8). Speculation lands here,
+        # is promoted only when a demand actually uses it, and a wrong guess
+        # ages out without costing a main-cache slot. Caller-thread only.
+        self.victim = OrderedDict()  # (layer, eid) → parsed expert
+        self.victim_cap = max(16, cache_size // 16) if cache_size else 16
+        self.victim_hits = 0
+
         self._fd_lock = threading.Lock()
 
     def _get_fd(self, layer_idx):
@@ -442,6 +452,16 @@ class MoEExpertReader:
                     cache_hits += 1
                     continue
 
+            # 1.5 Victim buffer — a correct speculation earns promotion
+            vkey = (layer_idx, eid)
+            if vkey in self.victim:
+                parsed = self.victim.pop(vkey)
+                experts[eid] = parsed
+                self.victim_hits += 1
+                if self.lru:
+                    self.lru.put(layer_idx, eid, parsed)
+                continue
+
             # 2. Check prefetched data (already read from SSD)
             if eid in futures:
                 raw = futures[eid].result()
@@ -480,17 +500,19 @@ class MoEExpertReader:
                     self.lru.put(layer_idx, eid, parsed)
 
         # Leftover prefetched futures (prefetched but not activated this
-        # token): a completed read is already paid for — bank it in the
-        # cache; a queued-not-started read frees its worker via cancel.
+        # token): a completed read is already paid for — park it in the
+        # victim buffer (NOT the main LRU, which it would pollute); a
+        # queued-not-started read frees its worker via cancel.
         for eid, fut in futures.items():
             if eid in experts:
                 continue
             if fut.done():
                 try:
                     raw = fut.result()
-                    if self.lru:
-                        self.lru.put(layer_idx, eid,
-                                     self._parse_expert_data(raw, eid))
+                    self.victim[(layer_idx, eid)] = self._parse_expert_data(raw, eid)
+                    self.victim.move_to_end((layer_idx, eid))
+                    while len(self.victim) > self.victim_cap:
+                        self.victim.popitem(last=False)
                     bytes_read += len(raw)
                 except Exception as e:
                     log.warning("prefetch read failed L%d E%d: %s",
@@ -533,7 +555,7 @@ class MoEExpertReader:
         avg_ms = self.read_time / self.reads * 1000
         throughput = self.bytes_read / self.read_time / 1e9 if self.read_time > 0 else 0
         s = (f"reads={self.reads}, ssd_reads={ssd_reads}, cache_hits={self.cache_hits}, "
-             f"prefetch_hits={self.prefetch_hits}, "
+             f"prefetch_hits={self.prefetch_hits}, victim_hits={self.victim_hits}, "
              f"avg={avg_ms:.1f}ms/expert, "
              f"throughput={throughput:.1f} GB/s, "
              f"total_bytes={self.bytes_read/1e9:.2f} GB, "
