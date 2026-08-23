@@ -22,12 +22,34 @@ BIAS_VALUES = [0.5, 1.0, 1.5]
 PPL_TOLERANCE = 1.05
 
 
+def _available_ram_bytes():
+    """Reclaimable memory right now (free + inactive + purgeable +
+    speculative pages). Total RAM overstates what the cache can use when
+    other apps are running — overshooting sends the machine into swap on
+    the same SSD the experts stream from, collapsing read throughput."""
+    import subprocess
+    out = subprocess.run(["vm_stat"], capture_output=True, text=True).stdout
+    page_size = 16384
+    pages = 0
+    for line in out.splitlines():
+        for key in ("Pages free", "Pages inactive", "Pages purgeable",
+                    "Pages speculative"):
+            if line.startswith(key + ":"):
+                pages += int(line.split(":")[1].strip().rstrip("."))
+    return pages * page_size
+
+
 def auto_size_cache(model_dir, ram_gb=None):
+    measured = None
     if ram_gb is None:
         import subprocess
         result = subprocess.run(["sysctl", "-n", "hw.memsize"], capture_output=True, text=True)
         ram_bytes = int(result.stdout.strip())
         ram_gb = ram_bytes / (1024**3)
+        try:
+            measured = _available_ram_bytes()
+        except Exception:
+            measured = None
 
     pinned_path = os.path.join(model_dir, "pinned.safetensors")
     pinned_bytes = os.path.getsize(pinned_path) if os.path.exists(pinned_path) else 2 * 1024**3
@@ -46,6 +68,9 @@ def auto_size_cache(model_dir, ram_gb=None):
     os_overhead = 4 * 1024**3
     headroom = 3 * 1024**3
     available = (ram_gb * 1024**3) - os_overhead - pinned_bytes - headroom
+    if measured is not None:
+        # Don't budget memory other running apps are already using.
+        available = min(available, measured - pinned_bytes - 2 * 1024**3)
     max_cache = int(available / expert_block_bytes)
     max_cache = max(500, min(max_cache, 10000))
     return max_cache, expert_block_bytes, pinned_bytes
