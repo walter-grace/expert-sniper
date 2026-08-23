@@ -319,6 +319,14 @@ def _preprocess(download_dir, output_dir, delete_shards=True, repo=None):
 
     for si, shard_name in enumerate(ordered):
         sf = os.path.join(download_dir, shard_name)
+        part_path = os.path.join(parts_dir, f"part_{shard_name}")
+        if not os.path.exists(sf) and os.path.exists(part_path):
+            # Shard was fully processed by a previous run (its pinned part is
+            # only saved after all its layers are flushed) and then deleted —
+            # don't re-download it.
+            print(f"  Shard {si+1}/{len(ordered)}: {shard_name} "
+                  f"already processed — skipping")
+            continue
         if not os.path.exists(sf):
             if repo is None:
                 raise FileNotFoundError(f"{sf} missing and no repo to fetch from")
@@ -345,7 +353,6 @@ def _preprocess(download_dir, output_dir, delete_shards=True, repo=None):
         # Persist this shard's pinned tensors NOW so no lazy reference into
         # the shard's mmap survives its deletion.
         if shard_pinned:
-            part_path = os.path.join(parts_dir, f"part_{shard_name}")
             mx.save_safetensors(part_path, shard_pinned)
         del shard_pinned
 
