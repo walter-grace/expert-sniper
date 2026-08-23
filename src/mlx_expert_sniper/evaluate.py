@@ -85,7 +85,7 @@ def perplexity(engine, bias=0.0, text_path=None, seq_len=512, max_chunks=8,
 
 
 def evaluate_model(model_dir, bias=None, text_path=None, seq_len=512,
-                   max_chunks=8):
+                   max_chunks=8, mode="prefill"):
     """CLI entry: load the engine, run perplexity, print reader stats.
 
     bias=None uses the calibrated bias (0.0 if uncalibrated).
@@ -98,7 +98,8 @@ def evaluate_model(model_dir, bias=None, text_path=None, seq_len=512,
           f"({max_chunks} chunks x {seq_len} tokens)")
 
     ppl = perplexity(engine, bias=use_bias, text_path=text_path,
-                     seq_len=seq_len, max_chunks=max_chunks, verbose=True)
+                     seq_len=seq_len, max_chunks=max_chunks, verbose=True,
+                     mode=mode)
 
     print(f"\nPerplexity: {ppl:.3f}")
     print(f"\nReader stats:\n  {engine.reader.stats()}")

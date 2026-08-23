@@ -243,10 +243,18 @@ def sweep_routing_bias(model_dir, cache_size, bias_values=BIAS_VALUES,
 
     results = {}
     for bias in [0.0] + list(bias_values):
-        print(f"  Measuring ppl at bias={bias}...", end=" ", flush=True)
+        print(f"  Measuring decode ppl at bias={bias}...", end=" ", flush=True)
         engine = _build_engine(model_dir, cache_size, enable_prediction=True)
         try:
-            results[bias] = perplexity(engine, bias=bias)
+            # Warm the expert cache like a serving session, then measure in
+            # DECODE mode — prefill-mode ppl is blind to bias damage because
+            # the cache barely engages during prefill (measured: bias=1.5
+            # scored 4.33 prefill vs 13.1 decode on Qwen3-30B).
+            list(generate_stream(
+                engine, [{"role": "user", "content": "Warm up."}],
+                bias=bias, max_tokens=20))
+            results[bias] = perplexity(engine, bias=bias, text_path=eval_text,
+                                       seq_len=192, max_chunks=2, mode="decode")
             print(f"ppl={results[bias]:.3f}")
             # One qualitative generation per bias — eyeball only, not a gate.
             sample = "".join(generate_stream(

@@ -184,6 +184,7 @@ def cmd_eval(args):
         text_path=args.text,
         seq_len=args.seq_len,
         max_chunks=args.chunks,
+        mode="decode" if args.decode else "prefill",
     )
 
 
@@ -239,6 +240,9 @@ def main():
     p.add_argument("--text", default=None, help="Eval text file (default: bundled)")
     p.add_argument("--seq-len", type=int, default=512)
     p.add_argument("--chunks", type=int, default=8)
+    p.add_argument("--decode", action="store_true",
+                   help="Token-by-token decode-mode ppl (slow; engages the "
+                        "routing bias like real serving — prefill mode doesn't)")
 
     args = parser.parse_args()
     if args.command is None:
