@@ -252,6 +252,17 @@ tokens-per-forward converts almost directly into round-trip amortization.
 ~25-30 tok/s across two consumer Macs (projection, not yet measured —
 needs two 16 GB machines).
 
+### Related work
+
+FreeToken (FlashML, arXiv:2608.16157) attacks the same sparsity on CUDA
+gaming PCs — host-RAM-to-VRAM expert streaming with bandwidth-adaptive
+CPU/GPU co-execution and elastic cache/KV memory reallocation. Convergent
+designs: both use global LRU expert caching and streaming across a memory
+hierarchy. Divergent scope: this project targets Apple Silicon (SSD ->
+unified memory), extends across machines (the Expert Network), and adds
+content-addressed verification. Their elastic memory reallocation and
+semantic KV anchors are techniques worth adopting here (tracked in issues).
+
 ## Honest Results: Three-Way A/B Test
 
 ### llama.cpp Expert Memory Management (clean A/B on same hardware)
