@@ -82,9 +82,11 @@ class RemoteDraft:
     """
 
     def __init__(self, base_url, model, tokenizer, tail_tokens=512,
-                 timeout=20):
+                 timeout=20, api_key=None):
+        import os
         self.base_url = base_url.rstrip("/")
         self.model = model
+        self.api_key = api_key or os.environ.get("DRAFT_API_KEY")
         self.tokenizer = tokenizer
         self.tail_tokens = tail_tokens
         self.timeout = timeout
@@ -99,9 +101,11 @@ class RemoteDraft:
         if self.model:  # some servers 404 on unknown ids; omit when unset
             payload["model"] = self.model
         body = _json.dumps(payload).encode()
+        headers = {"Content-Type": "application/json"}
+        if self.api_key:
+            headers["Authorization"] = f"Bearer {self.api_key}"
         req = urllib.request.Request(
-            f"{self.base_url}/completions", data=body,
-            headers={"Content-Type": "application/json"})
+            f"{self.base_url}/completions", data=body, headers=headers)
         self.requests += 1
         try:
             with urllib.request.urlopen(req, timeout=self.timeout) as r:
