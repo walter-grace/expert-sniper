@@ -56,7 +56,11 @@ def parse_partition(spec, num_experts):
 
 
 def fetch_block(peers, layer, eid, want_hash, tries=3):
-    """Pull one expert block, trying peers in order. Verified or nothing."""
+    """Pull one expert block, trying peers in order. Verified or nothing.
+
+    Returns the peer that served it so the caller can credit them: seeding is
+    paid work, and the receiver is the only party that knows what actually
+    arrived intact."""
     last = None
     for attempt in range(tries):
         peer = peers[(attempt + layer + eid) % len(peers)]
@@ -81,6 +85,10 @@ def main():
     p.add_argument("--coordinator", default="https://herorunai.com")
     p.add_argument("--peers", default=None, help="comma-separated peer URLs (skip discovery)")
     p.add_argument("--jobs", type=int, default=6, help="parallel block fetches")
+    p.add_argument("--node-id", default=None,
+                   help="this machine's node id, for crediting the peers that seeded it")
+    p.add_argument("--no-attest", action="store_true",
+                   help="do not report who delivered the blocks (they go unpaid)")
     args = p.parse_args()
 
     out = os.path.expanduser(args.out)
@@ -116,6 +124,7 @@ def main():
 
     # --- pull, verify, write sparse ---------------------------------------
     done = 0
+    delivered = {}
     t0 = time.time()
     for layer in range(num_layers):
         path = os.path.join(out, "bin", f"layer_{layer:02d}.bin")
@@ -132,12 +141,13 @@ def main():
 
             def one(eid):
                 data, peer = fetch_block(peers, layer, eid, blocks.get(f"{layer}:{eid}"))
-                return eid, data
+                return eid, data, peer
 
             with ThreadPoolExecutor(max_workers=args.jobs) as pool:
-                for eid, data in pool.map(one, mine):
+                for eid, data, peer in pool.map(one, mine):
                     f.seek(PAGE_SIZE + eid * block_size)
                     f.write(data)
+                    delivered[peer["nodeId"]] = delivered.get(peer["nodeId"], 0) + len(data)
                     done += 1
             rate = done * block_size / 1e6 / max(0.1, time.time() - t0)
             print(f"  layer {layer + 1}/{num_layers}  {done}/{total} blocks  "
@@ -145,7 +155,27 @@ def main():
 
     real = sum(os.stat(os.path.join(out, "bin", f)).st_blocks * 512
                for f in os.listdir(os.path.join(out, "bin")))
-    print(f"\n\n{done} blocks verified and written in {time.time() - t0:.0f}s")
+    # --- credit the machines that seeded us --------------------------------
+    if delivered and not args.no_attest and args.key:
+        me = args.node_id or f"{os.uname().nodename.lower()[:16]}-fetch"
+        payload = json.dumps({
+            "receiverId": me,
+            "deliveries": [{"nodeId": n, "bytes": b} for n, b in delivered.items()],
+        }).encode()
+        req = urllib.request.Request(
+            f"{args.coordinator}/api/yield/attest", data=payload,
+            headers={"Content-Type": "application/json", "x-api-key": args.key,
+                     "User-Agent": "expert-fetch/0.3"})
+        try:
+            with urllib.request.urlopen(req, timeout=20) as r:
+                res = json.loads(r.read())
+            n = len(res.get("credited") or [])
+            print(f"\n\ncredited {n} seeder(s) for delivering your partition")
+        except Exception as e:
+            print(f"\n\ncould not credit seeders ({type(e).__name__}) — "
+                  f"they served you anyway")
+
+    print(f"\n{done} blocks verified and written in {time.time() - t0:.0f}s")
     print(f"on disk: {real / 1e9:.1f} GB (sparse)")
     print(f"\nNext: copy pinned.safetensors + config.json from a peer or the "
           f"source repo, then:\n  expert-node --model-dir {out} "
