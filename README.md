@@ -147,6 +147,26 @@ produced no output.
 - `src/expert_network/` — the Expert Network: nodes, binary protocol,
   distributed driver, HRW roster placement
 
+## Non-Mac hardware: DGX Spark, gaming PCs (sidecar)
+
+The MLX engine is Apple Silicon, but Machine Yield is not. Any box running
+its own MoE engine — FreeToken on a DGX Spark or an RTX rig, vLLM,
+llama.cpp — joins through the sidecar, which proves what the yield system
+actually needs proven: that the machine holds the weights (content-
+addressed 4 MB chunk challenges), that it is alive (heartbeats + a health
+poll of the engine's OpenAI-compatible endpoint), and what it serves.
+
+```bash
+# on the Spark: FreeToken serving GLM/DeepSeek on :8000, then
+expert-sidecar --model-path ~/models/GLM-4.6 --engine-url http://127.0.0.1:8000     --join <api-key> --advertise-url https://your-tunnel.example.com
+
+# once per model, publish its chunk manifest:
+expert-sidecar --model-path ~/models/GLM-4.6 --write-manifest
+```
+
+Stdlib-only — no mlx, no extra deps. Expert-partition serving on CUDA
+(the full network tier) is future work; see the issues.
+
 ## Security notes
 
 - `mlx-sniper serve` and the agent CLIs bind `127.0.0.1` by default. There is
