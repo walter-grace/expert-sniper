@@ -27,6 +27,13 @@ border:1px solid var(--line);border-radius:8px;padding:8px;font:12px ui-monospac
 <p class="mut">Round one decodes normally. Round two turns on Fast Token: a draft
 node proposes tokens, this model verifies the batch in one pass. Back to back on
 this machine's engine, which is the honest side-by-side.</p>
+<p class="mut" style="margin-top:6px">What to expect: on a machine that streams
+experts from SSD, watch the right lane's meters &mdash; drafts accepted live,
+several tokens per forward &mdash; but the multiplier usually lands at or below
+1&times;, because the verify batch reads more experts than it saves. The
+speedup is real where experts sit resident in memory: network nodes, or a
+32&nbsp;GB+ machine whose cache holds the whole model. Every number on screen
+is measured, nothing is staged.</p>
 <div class="card" style="margin-top:14px">
 <div class="mut">Prompt</div>
 <input id="prompt" value="Write a Python function that reverses a linked list, with a docstring and a short example.">
