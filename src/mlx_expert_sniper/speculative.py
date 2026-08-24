@@ -140,6 +140,7 @@ class DFlashDraft:
 
     def __init__(self, head_path, engine):
         import json, os
+        from pathlib import Path
         import mlx.core as mx
         from mlx_lm.utils import load_model
         from dflash_mlx.model import DFlashDraftModel, DFlashDraftModelArgs
@@ -155,7 +156,7 @@ class DFlashDraft:
         if changed:
             json.dump(cfg, open(cfg_path, "w"), indent=2)
         self.model, _ = load_model(
-            path, get_model_classes=lambda c: (DFlashDraftModel, DFlashDraftModelArgs))
+            Path(path), get_model_classes=lambda config: (DFlashDraftModel, DFlashDraftModelArgs))
         self.engine = engine
         self.layer_ids = list(self.model.target_layer_ids)
         self.block = int(self.model.block_size)
