@@ -197,6 +197,27 @@ def create_app(experts, expert_ids, num_layers, num_experts, model_dir=None):
     return app
 
 
+def _open_sealed(link, coordinator):
+    """Decrypt a Hero sealed link locally. The #fragment key never reaches the coordinator; the
+    plaintext never touches disk. Returns the dict of sealed variables."""
+    try:
+        from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+    except Exception:
+        raise SystemExit("--sealed needs the network extra:  pip install 'mlx-expert-sniper[network]'")
+    import base64, json as _json, urllib.request
+    frag = link.split("#", 1)[1] if "#" in link else ""
+    kb = frag[2:] if frag.startswith("k=") else frag
+    path = link.split("#", 1)[0]
+    sid = path.split("/s/")[1] if "/s/" in path else path.rstrip("/").split("/")[-1]
+    raw = base64.urlsafe_b64decode(kb + "=" * (-len(kb) % 4))
+    with urllib.request.urlopen(f"{coordinator}/api/seal?id={sid}&consume=1") as r:
+        j = _json.load(r)
+    if j.get("error"):
+        raise SystemExit(f"sealed link: {j['error']}")
+    pt = AESGCM(raw).decrypt(base64.b64decode(j["iv"]), base64.b64decode(j["ct"]), None)
+    return _json.loads(pt.decode())
+
+
 def main():
     parser = argparse.ArgumentParser(description="Expert Network node")
     parser.add_argument("--model-dir", required=True)
@@ -214,6 +235,9 @@ def main():
                         help="Metal memory cap (default: partition size + 25%%)")
     parser.add_argument("--join", metavar="API_KEY", default=None,
                         help="Join Machine Yield with your Hero API key")
+    parser.add_argument("--sealed", metavar="LINK", default=None,
+                        help="Join with a Hero sealed link (/s/<id>#<key>) carrying HERO_RUN_KEY "
+                             "instead of putting the key on the command line / in shell history")
     parser.add_argument("--coordinator", default="https://herorunai.com",
                         help="Machine Yield coordinator")
     parser.add_argument("--node-id", default=None,
@@ -222,6 +246,17 @@ def main():
                         help="URL the coordinator can reach this node at "
                              "(default: http://<host>:<port>)")
     args = parser.parse_args()
+
+    # A sealed link keeps the API key out of the command line and shell history: its #fragment key
+    # decrypts here (never sent to the coordinator), yielding HERO_RUN_KEY (and optionally an
+    # advertise URL). See herorunai.com/seal.
+    if args.sealed and not args.join:
+        v = _open_sealed(args.sealed, args.coordinator)
+        args.join = v.get("HERO_RUN_KEY") or v.get("hero_run_key")
+        if not args.advertise_url:
+            args.advertise_url = v.get("PUBLIC_URL") or v.get("advertise_url")
+        if not args.join:
+            parser.error("sealed link did not contain HERO_RUN_KEY")
 
     with open(os.path.join(os.path.expanduser(args.model_dir), "config.json")) as f:
         config = json.load(f)
