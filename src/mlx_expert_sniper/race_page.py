@@ -55,9 +55,11 @@ is measured, nothing is staged.</p>
 <div class="card" style="margin-top:14px"><span class="lane-t">&#9670; DFlash (block-diffusion drafts)</span>
 <p class="mut" style="margin-top:4px">A different speculative system for comparison:
 z-lab's DFlash drafts 16 tokens in one diffusion pass. Runs its own server and its
-own model, so this is a system-vs-system look, not same-model. Measured here on a
-16&nbsp;GB M4 with the 4B head: baseline 38.0 tok/s, DFlash 36.5 &mdash; 0.96&times;
-at 73.5% acceptance. Start one with:
+own model, so this is a system-vs-system look, not same-model. Measured clean on a
+16&nbsp;GB M4 with the 4B head: stock 37.0 tok/s, DFlash ~45&ndash;56 &mdash;
+a real 1.2&ndash;1.5&times; at 73.5% acceptance. (An earlier 0.96&times; reading
+was retracted: it was taken while other models loaded the machine &mdash;
+contention poisons benchmarks.) Start one with:
 <span style="font-family:ui-monospace,monospace">dflash serve --model mlx-community/Qwen3.5-4B-4bit --draft z-lab/Qwen3.5-4B-DFlash --port 8090</span></p>
 <div class="row" style="margin-top:8px">
 <div><div class="mut">DFlash server</div><input id="dfl-url" value="http://127.0.0.1:8090/v1"></div>
