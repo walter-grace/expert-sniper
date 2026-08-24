@@ -41,7 +41,7 @@ is measured, nothing is staged.</p>
 <div><div class="mut">Draft source</div><select id="draft-src" style="width:100%;background:#0D0B14;color:var(--ink);border:1px solid var(--line);border-radius:8px;padding:8px;font:12px ui-monospace,monospace;margin-top:6px">
 <option value="local">Local 0.6B on this machine (fastest)</option>
 <option value="url">Remote draft node URL below</option>
-</select><input id="draft" value="http://66.94.126.39:8312/v1" style="margin-top:6px"></div>
+</select><input id="draft" value="https://draft.engramemory.dev/v1" style="margin-top:6px"></div>
 <div><div class="mut">Draft tokens per round (K)</div><input id="k" value="4"></div>
 </div>
 <button id="go">Race</button><span class="win" id="win"></span>
