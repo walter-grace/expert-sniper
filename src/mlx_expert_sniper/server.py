@@ -92,7 +92,8 @@ class OllamaHandler(BaseHTTPRequestHandler):
                 messages = [{"role": "user",
                              "content": body.get("prompt", "hello")}]
             stream = body.get("stream", True)
-            max_tokens = body.get("options", {}).get("num_predict", 200)
+            opts = body.get("options", {})
+            max_tokens = opts.get("num_predict", 200)
             engine = _get_engine()
         except Exception as e:
             self.send_error(500, str(e))
@@ -103,15 +104,27 @@ class OllamaHandler(BaseHTTPRequestHandler):
         self._cors()
         self.end_headers()
 
-        from .generate import generate_stream
+        spec_stats = {}
+        if opts.get("spec"):
+            from .speculative import spec_generate_stream, RemoteDraft
+            draft = (RemoteDraft(opts["draft_url"], opts.get("draft_model"),
+                                 engine.tokenizer)
+                     if opts.get("draft_url") else None)
+            gen = spec_generate_stream(engine, messages, bias=_bias,
+                                       max_tokens=max_tokens,
+                                       k=int(opts.get("spec_k", 8)),
+                                       draft=draft, stats=spec_stats)
+        else:
+            from .generate import generate_stream
+            gen = generate_stream(engine, messages, bias=_bias,
+                                  max_tokens=max_tokens)
         t0 = time.time()
         total_tokens = 0
         full_response = ""
         preview = messages[-1].get("content", "")[:40]
 
         try:
-            for token_text in generate_stream(engine, messages, bias=_bias,
-                                              max_tokens=max_tokens):
+            for token_text in gen:
                 total_tokens += 1
                 full_response += token_text
                 if stream:
@@ -133,6 +146,12 @@ class OllamaHandler(BaseHTTPRequestHandler):
             "eval_count": total_tokens,
             "eval_duration": int(elapsed * 1e9),
         }
+        if spec_stats.get("forwards"):
+            done["spec"] = {
+                "forwards": spec_stats["forwards"],
+                "drafted": spec_stats["drafted"],
+                "accepted": spec_stats["accepted"],
+            }
         try:
             self._ndjson(done)
         except (BrokenPipeError, ConnectionResetError):
