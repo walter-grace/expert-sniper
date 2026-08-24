@@ -46,6 +46,18 @@ def _get_engine():
 
 
 class OllamaHandler(BaseHTTPRequestHandler):
+    def _cors(self):
+        # Browser chat UIs (e.g. a page on another origin talking to this
+        # local server) need CORS; the server still binds 127.0.0.1.
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type")
+        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+
+    def do_OPTIONS(self):
+        self.send_response(204)
+        self._cors()
+        self.end_headers()
+
     def do_GET(self):
         if self.path == "/api/tags":
             self._json_response({
@@ -88,6 +100,7 @@ class OllamaHandler(BaseHTTPRequestHandler):
 
         self.send_response(200)
         self.send_header("Content-Type", "application/x-ndjson")
+        self._cors()
         self.end_headers()
 
         from .generate import generate_stream
@@ -130,6 +143,7 @@ class OllamaHandler(BaseHTTPRequestHandler):
     def _json_response(self, data):
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
+        self._cors()
         self.end_headers()
         self.wfile.write(json.dumps(data).encode())
 
