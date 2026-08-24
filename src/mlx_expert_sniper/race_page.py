@@ -38,7 +38,10 @@ is measured, nothing is staged.</p>
 <div class="mut">Prompt</div>
 <input id="prompt" value="Write a Python function that reverses a linked list, with a docstring and a short example.">
 <div class="row" style="margin-top:8px">
-<div><div class="mut">Draft node</div><input id="draft" value="http://66.94.126.39:8312/v1"></div>
+<div><div class="mut">Draft source</div><select id="draft-src" style="width:100%;background:#0D0B14;color:var(--ink);border:1px solid var(--line);border-radius:8px;padding:8px;font:12px ui-monospace,monospace;margin-top:6px">
+<option value="local">Local 0.6B on this machine (fastest)</option>
+<option value="url">Remote draft node URL below</option>
+</select><input id="draft" value="http://66.94.126.39:8312/v1" style="margin-top:6px"></div>
 <div><div class="mut">Draft tokens per round (K)</div><input id="k" value="4"></div>
 </div>
 <button id="go">Race</button><span class="win" id="win"></span>
@@ -113,7 +116,10 @@ $("go").onclick=async()=>{
     $("status").textContent="Round 1: standard decode\u2026";
     await lane("std",{});
     $("status").textContent="Round 2: Fast Token\u2026";
-    await lane("fast",{spec:true,draft_url:$("draft").value,spec_k:parseInt($("k").value)||4});
+    const dopts={spec:true,spec_k:parseInt($("k").value)||4};
+    if($("draft-src").value==="local"){dopts.draft_model="~/models/qwen3-0.6b-4bit";}
+    else{dopts.draft_url=$("draft").value;}
+    await lane("fast",dopts);
     $("status").textContent="done";
     if(tps.std&&tps.fast)$("win").textContent=(tps.fast/tps.std).toFixed(2)+"\u00d7 with Fast Token";
   }catch(e){$("status").textContent="failed: "+e.message}

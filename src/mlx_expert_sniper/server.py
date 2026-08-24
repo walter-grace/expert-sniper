@@ -16,6 +16,7 @@ _bias = 0.0
 _model_dir = None
 _model_name = "expert-sniper"
 _model_size = 0
+_draft_cache = {}
 
 
 def _get_engine():
@@ -120,10 +121,22 @@ class OllamaHandler(BaseHTTPRequestHandler):
 
         spec_stats = {}
         if opts.get("spec"):
-            from .speculative import spec_generate_stream, RemoteDraft
-            draft = (RemoteDraft(opts["draft_url"], opts.get("draft_model"),
-                                 engine.tokenizer)
-                     if opts.get("draft_url") else None)
+            from .speculative import (spec_generate_stream, RemoteDraft,
+                                      ModelDraft)
+            global _draft_cache
+            if opts.get("draft_url"):
+                draft = RemoteDraft(opts["draft_url"], opts.get("draft_model"),
+                                    engine.tokenizer)
+            elif opts.get("draft_model"):
+                # Local in-process drafting — the fastest, simplest option.
+                # Loaded once and cached across requests.
+                path = os.path.expanduser(opts["draft_model"])
+                if _draft_cache.get("path") != path:
+                    _draft_cache = {"path": path,
+                                    "draft": ModelDraft(path, engine.tokenizer)}
+                draft = _draft_cache["draft"]
+            else:
+                draft = None
             gen = spec_generate_stream(engine, messages, bias=_bias,
                                        max_tokens=max_tokens,
                                        k=int(opts.get("spec_k", 8)),
