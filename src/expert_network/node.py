@@ -16,6 +16,7 @@ import fcntl
 import gc
 import json
 import os
+import sys
 import time
 
 import numpy as np
@@ -50,6 +51,25 @@ def load_expert_from_bin(fd, expert_id, layout, tensor_layout):
         flat = mx.array(np.frombuffer(arr_bytes, dtype=np.uint8))
         result[name] = flat.view(dtype).reshape(info["shape_per_expert"])
     return result
+
+
+def _available_ram_gb():
+    """Free memory right now, not total: sizing against total is what put a
+    streaming node into swap on the same SSD it was reading from."""
+    try:
+        import subprocess
+        out = subprocess.run(["vm_stat"], capture_output=True, text=True).stdout
+        page = 16384 if "page size of 16384" in out else 4096
+        free = spec = 0
+        for line in out.splitlines():
+            if line.startswith("Pages free:"):
+                free = int(line.split()[-1].rstrip("."))
+            elif line.startswith("Pages speculative:"):
+                spec = int(line.split()[-1].rstrip("."))
+        avail = (free + spec) * page / 1e9
+        return avail if avail > 0.5 else 8.0
+    except Exception:
+        return 8.0
 
 
 def load_partition(model_dir, expert_ids, num_layers):
@@ -219,6 +239,14 @@ def _open_sealed(link, coordinator):
 
 
 def main():
+    # Line-buffered: a node killed by the OS mid-load used to take its
+    # explanation with it, leaving an empty log and a mystery.
+    try:
+        sys.stdout.reconfigure(line_buffering=True)
+        sys.stderr.reconfigure(line_buffering=True)
+    except Exception:
+        pass
+
     parser = argparse.ArgumentParser(description="Expert Network node")
     parser.add_argument("--model-dir", required=True)
     g = parser.add_mutually_exclusive_group(required=True)
@@ -306,6 +334,24 @@ def main():
     hdr = parse_layer_header(os.path.join(model_dir, "bin", "layer_00.bin"))
     block = hdr["layout"]["expert_block_size"]
     est_gb = len(expert_ids) * num_layers * block / 1e9
+
+    # A machine that joins a big model while it is the only one there gets
+    # assigned every expert — 16 GB of them on a 16 GB Mac. That used to end
+    # as an OOM kill with the explanation buffered away in a dead process.
+    # Hold what fits instead, and say plainly how much of the model is still
+    # uncovered: an incomplete roster is the normal state of a network that
+    # is still filling up, not an error.
+    if not args.memory_limit_gb:
+        room_gb = _available_ram_gb() - 2.0        # leave the OS its working set
+        per_expert = num_layers * block / 1e9
+        fits = max(1, int(room_gb / per_expert)) if per_expert > 0 else len(expert_ids)
+        if fits < len(expert_ids):
+            print(f"  {len(expert_ids)} experts assigned but only {fits} fit in "
+                  f"{room_gb:.1f} GB of free memory — holding {fits}.")
+            print(f"  {num_experts - fits} of {num_experts} experts have no home "
+                  f"on this machine. The model needs more machines to be whole.")
+            expert_ids = expert_ids[:fits]
+            est_gb = len(expert_ids) * num_layers * block / 1e9
 
     import mlx.core as mx
     limit = args.memory_limit_gb or est_gb * 1.25 + 0.5
