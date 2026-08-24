@@ -90,7 +90,7 @@ $("dfl-go").onclick=async()=>{
   const out=$("out-dfl"),met=$("m-dfl");out.textContent="";met.textContent="";
   const t0=performance.now();let ttft=null,tok=0;
   try{
-    const r=await fetch($("dfl-url").value.replace(/\/$/,"")+"/completions",{
+    const r=await fetch($("dfl-url").value.replace(/[/]$/,"")+"/completions",{
       method:"POST",headers:{"Content-Type":"application/json"},
       body:JSON.stringify({prompt:$("prompt").value,max_tokens:200,temperature:0,stream:true})});
     const rd=r.body.getReader(),dec=new TextDecoder();let buf="";
