@@ -276,6 +276,41 @@ resident-expert network nodes, or a machine whose cache holds the whole model.
 z-lab measure 1.2-1.5x for DFlash on a fully resident 4B on the same hardware
 class, which is consistent with this explanation rather than against it.
 
+### The mesh has its own break-even: payload amplification
+
+Speculation was expected to win on resident-expert nodes, since the batch's
+wider expert union costs nothing when the experts are already in RAM. It does
+not win for free, because the round trip is not a fixed cost — the payload
+scales with the batch.
+
+Measured, OLMoE across two resident nodes (localhost), 80 tokens:
+
+| | tok/s | tok/forward | ms/layer | sent |
+|---|---|---|---|---|
+| no speculation | **18.09** | — | 2.8 | 16.1 MB |
+| prompt-lookup drafts, K=5 | 11.22 | 1.19 | 5.6 | 34.3 MB |
+
+Batching six tokens per forward doubled per-layer round-trip time and doubled
+bytes on the wire, while requests fell only 17%. At 12.5% acceptance the
+amortization (1.19 tok/forward) came nowhere near covering it.
+
+So the two tiers fail speculation for different reasons, and both are
+quantifiable:
+
+- **SSD tier**: must beat *expert-read amplification* — the batch reads more
+  weights from disk (39 GB -> 82 GB measured).
+- **Mesh tier**: must beat *payload amplification* — the batch sends more
+  activations per hop (2.8 -> 5.6 ms/layer measured).
+
+The mesh break-even is roughly `tok/forward > payload cost ratio`: about 2+
+tokens per forward here, which needs ~50% acceptance at K=5. An in-family
+0.6B draft on a 30B target measured 68% acceptance and 4.76 tok/forward,
+which would clear it — but that pairing cannot be tested on a mesh with one
+machine, since the 30B needs two machines' RAM to be resident and OLMoE (the
+only model that fits a two-node localhost mesh) has no tokenizer-compatible
+draft sibling. **This is the single most valuable measurement a second Apple
+Silicon machine would unlock.**
+
 ### Related work
 
 FreeToken (FlashML, arXiv:2608.16157) attacks the same sparsity on CUDA
