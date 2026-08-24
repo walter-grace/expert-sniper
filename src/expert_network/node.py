@@ -224,8 +224,10 @@ def main():
     g = parser.add_mutually_exclusive_group(required=True)
     g.add_argument("--partition", help="Contiguous range, e.g. '0-63'")
     g.add_argument("--experts", help="Explicit ids, e.g. '0,3,9,12'")
-    g.add_argument("--roster", help="Comma-separated node ids; partition is "
-                                    "derived by rendezvous hashing (needs --me)")
+    g.add_argument("--roster", help="Comma-separated node ids, or 'auto' to "
+                                    "take the live roster from the coordinator; "
+                                    "partition is derived by rendezvous hashing "
+                                    "(needs --me)")
     parser.add_argument("--me", help="This node's id within --roster")
     parser.add_argument("--port", type=int, default=8301)
     parser.add_argument("--host", default="127.0.0.1",
@@ -271,7 +273,32 @@ def main():
     else:
         if not args.me:
             parser.error("--roster requires --me")
-        expert_ids = hrw_partition(args.roster.split(","), args.me, num_experts)
+        if args.roster == "auto":
+            # Ask the coordinator who else is serving this model and take the
+            # slice rendezvous hashing gives us. Every node runs the same
+            # function over the same roster, so the network divides itself
+            # with no negotiation and no central assignment — and a machine
+            # knows its share before it downloads a byte.
+            import json as _json, urllib.request as _u
+            model_key = f"{num_layers}x{num_experts}"
+            url = (f"{args.coordinator}/api/yield/roster"
+                   f"?model={model_key}&me={args.me}")
+            try:
+                with _u.urlopen(_u.Request(url, headers={"User-Agent": "expert-node/0.3"}),
+                                timeout=15) as r:
+                    info = _json.loads(r.read())
+                roster = info.get("roster") or [args.me]
+            except Exception as e:
+                print(f"  roster lookup failed ({type(e).__name__}); "
+                      f"serving alone until the next restart")
+                roster = [args.me]
+            print(f"  roster: {len(roster)} machine(s) on {model_key} — "
+                  f"{', '.join(roster[:4])}{' …' if len(roster) > 4 else ''}")
+        else:
+            roster = args.roster.split(",")
+        expert_ids = hrw_partition(roster, args.me, num_experts)
+        print(f"  my share: {len(expert_ids)}/{num_experts} experts "
+              f"({100 * len(expert_ids) / max(1, num_experts):.0f}%)")
         print(f"HRW partition for {args.me!r}: {len(expert_ids)} experts")
     assert expert_ids and 0 <= min(expert_ids) and max(expert_ids) < num_experts
 
