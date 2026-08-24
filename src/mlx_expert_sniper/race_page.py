@@ -1,7 +1,7 @@
 """Built-in Fast Token race page, served same-origin by the Ollama server
 at /race — no CORS, no mixed-content, works in every browser."""
 
-RACE_HTML = """<!DOCTYPE html><html><head><meta charset="utf-8">
+RACE_HTML = r"""<!DOCTYPE html><html><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Fast Token race</title><style>
 :root{--bg:#08070C;--card:#14101F;--ink:#EDEAFB;--mut:#7C7494;--line:#241E36;--acc:#8F7CF6}
@@ -72,7 +72,7 @@ async function lane(key,opts){
       options:Object.assign({num_predict:120},opts)})});
   const rd=r.body.getReader(),dec=new TextDecoder();let buf="";
   for(;;){const{done,value}=await rd.read();if(done)break;
-    buf+=dec.decode(value,{stream:true});const ls=buf.split("\\n");buf=ls.pop();
+    buf+=dec.decode(value,{stream:true});const ls=buf.split("\n");buf=ls.pop();
     for(const l of ls){if(!l.trim())continue;let j;try{j=JSON.parse(l)}catch{continue}
       if(j.done){spec=j.spec||null;continue}
       const c=j.message&&j.message.content;if(!c)continue;
@@ -110,12 +110,12 @@ $("dfl-go").onclick=async()=>{
 $("go").onclick=async()=>{
   $("go").disabled=true;$("win").textContent="";tps={};
   try{
-    $("status").textContent="Round 1: standard decode\\u2026";
+    $("status").textContent="Round 1: standard decode\u2026";
     await lane("std",{});
-    $("status").textContent="Round 2: Fast Token\\u2026";
+    $("status").textContent="Round 2: Fast Token\u2026";
     await lane("fast",{spec:true,draft_url:$("draft").value,spec_k:parseInt($("k").value)||4});
     $("status").textContent="done";
-    if(tps.std&&tps.fast)$("win").textContent=(tps.fast/tps.std).toFixed(2)+"\\u00d7 with Fast Token";
+    if(tps.std&&tps.fast)$("win").textContent=(tps.fast/tps.std).toFixed(2)+"\u00d7 with Fast Token";
   }catch(e){$("status").textContent="failed: "+e.message}
   $("go").disabled=false;};
 </script></body></html>"""
