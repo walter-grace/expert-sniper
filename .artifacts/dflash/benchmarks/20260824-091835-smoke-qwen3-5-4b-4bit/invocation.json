@@ -1,0 +1,61 @@
+{
+  "argv": [
+    "dflash benchmark",
+    "--model",
+    "mlx-community/Qwen3.5-4B-4bit",
+    "--draft",
+    "z-lab/Qwen3.5-4B-DFlash",
+    "--prompt",
+    "Write a Python function that reverses a linked list, with a docstring and a short example.",
+    "--max-tokens",
+    "200",
+    "--repeat",
+    "2"
+  ],
+  "command": "dflash benchmark --model mlx-community/Qwen3.5-4B-4bit --draft z-lab/Qwen3.5-4B-DFlash --prompt 'Write a Python function that reverses a linked list, with a docstring and a short example.' --max-tokens 200 --repeat 2",
+  "effective": {
+    "block_tokens": 16,
+    "cache_limit": "auto",
+    "cooldown": 10,
+    "ctx_tokens": 0,
+    "draft": "z-lab/Qwen3.5-4B-DFlash",
+    "draft_quant": null,
+    "draft_sink_size": 64,
+    "draft_window_size": 1024,
+    "include_memory": true,
+    "limit": 1,
+    "max_tokens": 200,
+    "model": "mlx-community/Qwen3.5-4B-4bit",
+    "no_eos": false,
+    "no_memory": false,
+    "only_dflash": false,
+    "out": ".artifacts/dflash/benchmarks/20260824-091835-smoke-qwen3-5-4b-4bit",
+    "prefill_step_size": 2048,
+    "prompt": "Write a Python function that reverses a linked list, with a docstring and a short example.",
+    "prompt_file": null,
+    "repeat": 2,
+    "seed": 0,
+    "shuffle": false,
+    "suite": "smoke",
+    "target_fa_window": 0,
+    "use_chat_template": true,
+    "verify_len_cap": 0,
+    "verify_mode": "adaptive",
+    "wired_limit": "auto"
+  },
+  "explicit_flags": {
+    "draft": "z-lab/Qwen3.5-4B-DFlash",
+    "max_tokens": 200,
+    "model": "mlx-community/Qwen3.5-4B-4bit",
+    "prompt": "Write a Python function that reverses a linked list, with a docstring and a short example.",
+    "repeat": 2
+  },
+  "output_dir": ".artifacts/dflash/benchmarks/20260824-091835-smoke-qwen3-5-4b-4bit",
+  "output_path": ".artifacts/dflash/benchmarks/20260824-091835-smoke-qwen3-5-4b-4bit",
+  "primary_metric": "post_prefill_generation_tps",
+  "protocol_order": [
+    "baseline",
+    "dflash"
+  ],
+  "same_prompt_token_ids": true
+}

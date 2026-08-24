@@ -49,6 +49,18 @@ is measured, nothing is staged.</p>
 <div class="card"><span class="lane-t" style="color:var(--acc)">&#9889; Fast Token</span>
 <div class="out" id="out-fast">waiting&hellip;</div><div class="meter" id="m-fast"></div></div>
 </div>
+<div class="card" style="margin-top:14px"><span class="lane-t">&#9670; DFlash (block-diffusion drafts)</span>
+<p class="mut" style="margin-top:4px">A different speculative system for comparison:
+z-lab's DFlash drafts 16 tokens in one diffusion pass. Runs its own server and its
+own model, so this is a system-vs-system look, not same-model. Measured here on a
+16&nbsp;GB M4 with the 4B head: baseline 38.0 tok/s, DFlash 36.5 &mdash; 0.96&times;
+at 73.5% acceptance. Start one with:
+<span style="font-family:ui-monospace,monospace">dflash serve --model mlx-community/Qwen3.5-4B-4bit --draft z-lab/Qwen3.5-4B-DFlash --port 8090</span></p>
+<div class="row" style="margin-top:8px">
+<div><div class="mut">DFlash server</div><input id="dfl-url" value="http://127.0.0.1:8090/v1"></div>
+<div style="display:flex;align-items:flex-end"><button id="dfl-go" style="margin-top:0">Run DFlash</button></div>
+</div>
+<div class="out" id="out-dfl">waiting&hellip;</div><div class="meter" id="m-dfl"></div></div>
 <script>
 const $=id=>document.getElementById(id);
 let tps={};
@@ -73,6 +85,28 @@ async function lane(key,opts){
   if(spec)met.innerHTML+=" &middot; "+(tok/spec.forwards).toFixed(1)+
     " tok/forward &middot; "+Math.round(100*spec.accepted/Math.max(1,spec.drafted))+"% drafts accepted";
 }
+$("dfl-go").onclick=async()=>{
+  $("dfl-go").disabled=true;
+  const out=$("out-dfl"),met=$("m-dfl");out.textContent="";met.textContent="";
+  const t0=performance.now();let ttft=null,tok=0;
+  try{
+    const r=await fetch($("dfl-url").value.replace(/\/$/,"")+"/completions",{
+      method:"POST",headers:{"Content-Type":"application/json"},
+      body:JSON.stringify({prompt:$("prompt").value,max_tokens:200,temperature:0,stream:true})});
+    const rd=r.body.getReader(),dec=new TextDecoder();let buf="";
+    for(;;){const{done,value}=await rd.read();if(done)break;
+      buf+=dec.decode(value,{stream:true});const ls=buf.split("\n");buf=ls.pop();
+      for(const l of ls){const t=l.replace(/^data: ?/,"").trim();
+        if(!t||t==="[DONE]")continue;let j;try{j=JSON.parse(t)}catch{continue}
+        const c=(j.choices&&j.choices[0]&&(j.choices[0].text||(j.choices[0].delta&&j.choices[0].delta.content)))||"";
+        if(!c)continue;
+        if(ttft===null)ttft=(performance.now()-t0)/1e3;
+        tok++;out.textContent+=c;out.scrollTop=out.scrollHeight;
+        const ds=(performance.now()-t0)/1e3-ttft;
+        met.innerHTML="<b>"+(ds>.3?(tok/ds).toFixed(2)+" tok/s":"&mdash;")+
+          "</b> &middot; TTFT "+ttft.toFixed(1)+"s &middot; "+tok+" tok";}}
+  }catch(e){met.textContent="failed: "+e.message}
+  $("dfl-go").disabled=false;};
 $("go").onclick=async()=>{
   $("go").disabled=true;$("win").textContent="";tps={};
   try{
