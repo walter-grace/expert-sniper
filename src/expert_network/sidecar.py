@@ -88,9 +88,16 @@ def build_manifest(model_path, model_key):
             "expert_block_size": CHUNK, "blocks": blocks}
 
 
-def engine_health(engine_url):
+def engine_health(engine_url, engine_key=None):
+    # Send the same bearer the draft proxy sends: hosted engines (Cerebras, any
+    # keyed OpenAI-compatible API) 401 an unauthenticated /v1/models, which used
+    # to read as "engine down" even while drafting worked (#16).
     try:
-        with urllib.request.urlopen(f"{engine_url}/v1/models", timeout=5) as r:
+        req = urllib.request.Request(f"{engine_url}/v1/models",
+                                     headers={"User-Agent": "expert-sidecar"})
+        if engine_key:
+            req.add_header("Authorization", f"Bearer {engine_key}")
+        with urllib.request.urlopen(req, timeout=5) as r:
             data = json.loads(r.read())
         return {"up": True,
                 "models": [m.get("id") for m in data.get("data", [])][:8]}
@@ -191,7 +198,7 @@ def main():
             elif self.path == "/health":
                 body = json.dumps({
                     "status": "ok", "engine": args.engine_name,
-                    "engine_health": engine_health(args.engine_url),
+                    "engine_health": engine_health(args.engine_url, engine_key),
                     "chunks": len(index), "gb": round(total_gb, 1),
                     "draft_requests": stats["draft_requests"],
                 }).encode()
@@ -220,7 +227,7 @@ def main():
         })
         yc.join()
         yc.start_heartbeat(lambda: {
-            "engine": engine_health(args.engine_url),
+            "engine": engine_health(args.engine_url, engine_key),
             "draft_requests": stats["draft_requests"],
         })
 
