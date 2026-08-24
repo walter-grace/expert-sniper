@@ -106,6 +106,10 @@ class OllamaHandler(BaseHTTPRequestHandler):
             self.send_error(500, str(e))
             return
 
+        # A client that stops reading mid-stream (closed tab) must not
+        # wedge the single-threaded server on a blocking write forever.
+        self.connection.settimeout(60)
+
         print(f"[req] {'fast-token' if opts.get('spec') else 'standard'} "
               f"start: {messages[-1].get('content', '')[:40]!r}", flush=True)
 
@@ -142,8 +146,8 @@ class OllamaHandler(BaseHTTPRequestHandler):
                                   "message": {"role": "assistant",
                                               "content": token_text},
                                   "done": False})
-        except (BrokenPipeError, ConnectionResetError):
-            print(f"  [client disconnected after {total_tokens} tok] {preview}")
+        except (BrokenPipeError, ConnectionResetError, TimeoutError, OSError):
+            print(f"  [client gone after {total_tokens} tok] {preview}")
             return
 
         elapsed = time.time() - t0
