@@ -164,6 +164,13 @@ def make_forward(engine, bias=0.0):
 
             h = h + expert_out
             mx.eval(h)
+            # Hidden-state capture for context-conditioned drafters (DFlash):
+            # the residual stream after layer i, keyed i+1, all positions.
+            cap = getattr(engine, "capture_layers", None)
+            if cap and i in cap:
+                buf = engine.captured.get(i + 1)
+                engine.captured[i + 1] = (h if buf is None
+                                          else mx.concatenate([buf, h], axis=1))
             del expert_data, expert_out, normed, attn_out
             mx.clear_cache()
 

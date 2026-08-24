@@ -124,7 +124,14 @@ class OllamaHandler(BaseHTTPRequestHandler):
             from .speculative import (spec_generate_stream, RemoteDraft,
                                       ModelDraft)
             global _draft_cache
-            if opts.get("draft_url"):
+            if opts.get("dflash_head"):
+                from .speculative import DFlashDraft
+                head = os.path.expanduser(opts["dflash_head"])
+                if _draft_cache.get("path") != head:
+                    _draft_cache = {"path": head,
+                                    "draft": DFlashDraft(head, engine)}
+                draft = _draft_cache["draft"]
+            elif opts.get("draft_url"):
                 draft = RemoteDraft(opts["draft_url"], opts.get("draft_model"),
                                     engine.tokenizer)
             elif opts.get("draft_model"):

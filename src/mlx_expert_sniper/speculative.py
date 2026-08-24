@@ -121,6 +121,88 @@ class RemoteDraft:
         return toks[base_len:base_len + k]
 
 
+class DFlashDraft:
+    """Block-diffusion drafting (z-lab DFlash) inside the streaming engine.
+
+    The draft head is conditioned on the TARGET's hidden states at a few
+    layers, so it must live inside the target's forward: make_forward
+    captures the residual stream after each listed layer (all positions);
+    this adapter projects them through the head's `fc`, denoises a block of
+    [last_token, mask...] against that context in ONE draft pass, and reads
+    the proposals out through the target's own final norm + lm_head. One
+    pass drafts up to block_size-1 tokens — versus one draft forward per
+    token for an autoregressive draft model.
+
+    Requires `dflash-mlx` (pip) and an official head for the target
+    (e.g. z-lab/Qwen3-Coder-30B-A3B-DFlash). v1: no draft KV cache —
+    context is re-projected each step (fine for chat-length contexts).
+    """
+
+    def __init__(self, head_path, engine):
+        import json, os
+        import mlx.core as mx
+        from mlx_lm.utils import load_model
+        from dflash_mlx.model import DFlashDraftModel, DFlashDraftModelArgs
+        path = self._resolve(head_path)
+        cfg_path = os.path.join(path, "config.json")
+        cfg = json.load(open(cfg_path))
+        # Older z-lab configs predate the mlx port's schema
+        changed = False
+        if "rope_theta" not in cfg:
+            cfg["rope_theta"] = (cfg.get("rope_parameters") or {}).get("rope_theta", 1e7); changed = True
+        if "block_size" not in cfg:
+            cfg["block_size"] = (cfg.get("dflash_config") or {}).get("block_size", 16); changed = True
+        if changed:
+            json.dump(cfg, open(cfg_path, "w"), indent=2)
+        self.model, _ = load_model(
+            path, get_model_classes=lambda c: (DFlashDraftModel, DFlashDraftModelArgs))
+        self.engine = engine
+        self.layer_ids = list(self.model.target_layer_ids)
+        self.block = int(self.model.block_size)
+        self.mask_id = int(self.model.mask_token_id)
+        if engine.num_layers <= max(self.layer_ids):
+            raise ValueError(f"head expects target layers {self.layer_ids}, "
+                             f"target has {engine.num_layers}")
+        engine.capture_layers = set(self.layer_ids)
+        engine.captured = {}
+        self.mx = mx
+
+    @staticmethod
+    def _resolve(ref):
+        import os
+        p = os.path.expanduser(ref)
+        if os.path.isdir(p):
+            return p
+        from huggingface_hub import snapshot_download
+        return snapshot_download(ref)
+
+    def trim(self, n):
+        """Roll captured context back over n rejected positions."""
+        if n <= 0:
+            return
+        for k, v in list(self.engine.captured.items()):
+            self.engine.captured[k] = v[:, :-n, :]
+
+    def __call__(self, context, k, max_ngram=None):
+        mx = self.mx
+        cap = self.engine.captured
+        if any((i + 1) not in cap for i in self.layer_ids):
+            return []
+        feats = mx.concatenate([cap[i + 1] for i in self.layer_ids], axis=-1)
+        draft_context = self.model.project_target_hidden(feats)
+        block_ids = mx.array([[context[-1]] + [self.mask_id] * (self.block - 1)],
+                             dtype=mx.uint32)
+        tm = self.engine.model
+        noise = tm.model.embed_tokens(block_ids) * self.model.embed_scale
+        noise = noise.astype(draft_context.dtype)
+        draft_hidden = self.model.forward_projected_context(
+            noise_embedding=noise, draft_context=draft_context, cache=None)
+        logits = tm.lm_head(tm.model.norm(draft_hidden[:, 1:, :]))
+        toks = mx.argmax(logits[0], axis=-1)
+        mx.eval(toks)
+        return [int(t) for t in toks.tolist()][:k]
+
+
 def spec_generate_stream(engine, messages, bias=0.0, max_tokens=200, k=8,
                          draft=None, stats=None):
     """Generator yielding token strings, speculative version of
@@ -141,6 +223,8 @@ def spec_generate_stream(engine, messages, bias=0.0, max_tokens=200, k=8,
     stats.setdefault("forwards", 0)
 
     engine.reset_cache()
+    if hasattr(engine, "captured"):
+        engine.captured = {}
     tok = engine.tokenizer
     try:
         text = tok.apply_chat_template(messages, tokenize=False,
@@ -189,6 +273,8 @@ def spec_generate_stream(engine, messages, bias=0.0, max_tokens=200, k=8,
             for c in engine.cache:
                 if c is not None:
                     c.trim(rejected)
+            if hasattr(draft, "trim"):
+                draft.trim(rejected)
 
         out_tokens = drafts[:m] + [preds[m]]
         stop = False

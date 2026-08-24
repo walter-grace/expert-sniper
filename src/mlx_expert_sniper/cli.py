@@ -82,7 +82,11 @@ def cmd_run(args):
     spec_stats = {}
     if args.spec:
         from .speculative import spec_generate_stream, ModelDraft, RemoteDraft
-        if args.draft_url:
+        if args.dflash:
+            from .speculative import DFlashDraft
+            draft = DFlashDraft(args.dflash, eng)
+            args.spec_k = min(args.spec_k, draft.block - 1)
+        elif args.draft_url:
             draft = RemoteDraft(args.draft_url, args.draft_model,
                                 eng.tokenizer)
         elif args.draft_model:
@@ -287,6 +291,9 @@ def main():
     p.add_argument("--draft-model", default=None,
                    help="Tokenizer-compatible draft model path/repo (local), "
                         "or the model id when using --draft-url")
+    p.add_argument("--dflash", default=None,
+                   help="DFlash block-diffusion draft head for this target "
+                        "(path or HF repo, e.g. z-lab/Qwen3-Coder-30B-A3B-DFlash)")
     p.add_argument("--draft-url", default=None,
                    help="OpenAI-compatible /v1 base URL of a remote draft "
                         "node (a GPU/DGX box on the network)")
