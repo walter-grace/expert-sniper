@@ -175,10 +175,14 @@ expert mesh verifies the batch in one forward. Any driver opts in:
 expert-net ~/models/... --nodes ... --spec --draft-url https://spark1.example.com/v1
 ```
 
-Measured over this path (Qwen3-0.6B drafting Qwen3-30B, drafts through
-the sidecar proxy): 4.0 tokens per verify forward at 41% acceptance —
-remote text-level drafting costs a little acceptance vs in-process (56%)
-but frees the draft to run on whatever hardware is fastest at it.
+Measured over this path, twice:
+- localhost sidecar proxy (0.6B drafting 30B): 4.0 tok/forward, 41% acceptance
+- **over the real internet** — a 6-vCPU VPS in a European datacenter
+  (llama.cpp, 44 tok/s draft speed) drafting for a 30B on a Mac mini:
+  **5.0 tok/forward at 56% acceptance, 12/12 rounds remote** — no
+  acceptance loss vs an in-process draft. The draft runs wherever
+  hardware is fastest and cheapest; the verify runs where the experts
+  live.
 
 ## Security notes
 
