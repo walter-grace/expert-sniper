@@ -252,6 +252,30 @@ tokens-per-forward converts almost directly into round-trip amortization.
 ~25-30 tok/s across two consumer Macs (projection, not yet measured —
 needs two 16 GB machines).
 
+### Speculative decoding loses on the SSD tier — three independent ways
+
+Every speculative method amortizes forwards correctly and still loses, because
+the verify batch activates a wider union of experts and evicts the cache.
+Measured on Qwen3-Coder-30B-A3B, 16 GB M4 mini, same prompt, quiet machine:
+
+| method | tok/s | cache hits | bytes read |
+|---|---|---|---|
+| baseline decode | **4.00** | 72.5% | 39 GB |
+| DFlash block-diffusion head (z-lab, official for this model) | 2.24 | 0% | 82 GB |
+| prompt-lookup / 0.6B draft model (earlier 30B, K sweep) | 0.6-0.7x | 0% | ~2x |
+
+DFlash's mechanism works — 3.53 tokens per verify forward at 36% acceptance,
+one diffusion pass drafting a masked block conditioned on hidden states
+captured from the target's own layers. It is the read amplification, not the
+draft quality, that decides the outcome. Acceptance also rises as K falls
+while speed keeps dropping (82% at K=4 was slower than 72% at K=8), which is
+the signature of a bandwidth-bound regime rather than a latency-bound one.
+
+Corollary: speculation belongs on the tier where the expert union is free —
+resident-expert network nodes, or a machine whose cache holds the whole model.
+z-lab measure 1.2-1.5x for DFlash on a fully resident 4B on the same hardware
+class, which is consistent with this explanation rather than against it.
+
 ### Related work
 
 FreeToken (FlashML, arXiv:2608.16157) attacks the same sparsity on CUDA

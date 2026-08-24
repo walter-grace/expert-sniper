@@ -33,11 +33,25 @@ Expert Sniper builds this in two tiers:
    shared node roster — every node derives the same assignment with zero
    coordination, and adding a node moves only ~1/N of the experts.
 
-Measured, two nodes + driver (localhost, OLMoE-1B-7B, 64 experts split
-32/32 by roster): **19.3 tok/s, TTFT 0.6 s, 2.9 ms/layer round trip,
-~0.24 MB of network traffic per token** — faster than the same model
-streaming from SSD on one machine (14.9 tok/s), because resident partitions
-take the SSD out of the token loop entirely.
+**One machine, measured** (16 GB M4 mini, Qwen3-Coder-30B-A3B 4-bit, 17 GB
+on disk): **4.0 tok/s, 72.5% expert-cache hit rate, 5.4 GB/s effective
+reads, ~3.6 GB peak RAM.** The model is larger than the machine's memory.
+
+**Two nodes + driver** (localhost, OLMoE-1B-7B, 64 experts split 32/32 by
+roster): **19.3 tok/s, TTFT 0.6 s, 2.9 ms/layer round trip, ~0.24 MB of
+network traffic per token** — faster than the same model streaming from SSD
+on one machine (14.9 tok/s), because resident partitions take the SSD out of
+the token loop entirely. *That measurement is localhost.* Across two physical
+machines it is a well-founded projection, not a result; see issue #3.
+
+**Joining does not mean downloading the whole model.** A node fetches only
+the experts it owns, from machines already serving them — the
+`/block/{layer}/{expert}` endpoint that proves a node holds an expert is the
+same one that hands it to the next node, and every block is checked against
+a published sha256 manifest on arrival. Blocks land in sparse files at the
+format's fixed offsets, so the engine reads them unchanged while the disk
+holds only this machine's slice (measured: 0.2 GB on disk for a partition of
+a 4 GB model).
 
 ```bash
 pip install -e ".[network]"
