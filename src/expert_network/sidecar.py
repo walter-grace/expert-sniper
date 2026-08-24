@@ -13,6 +13,11 @@ the three things it needs from hardware it can't run MLX on:
      engine's OpenAI-compatible endpoint
   3. registration — node id, engine, models, committed bytes
 
+DRAFT-ONLY nodes: omit --model-path and the sidecar becomes a pure Fast
+Token draft node — it proxies /v1/* to its engine (a local model server
+or a hosted provider like Cerebras via --engine-key) and earns standing
+through uptime and counted draft service instead of weight custody.
+
 Stdlib only: no mlx, no fastapi — it runs wherever Python runs.
 
   expert-sidecar --model-path ~/models/GLM-4.6-FTW \\
@@ -95,14 +100,19 @@ def engine_health(engine_url):
 
 def main():
     p = argparse.ArgumentParser(description="Machine Yield sidecar")
-    p.add_argument("--model-path", required=True,
-                   help="Model weights dir/file the engine serves")
+    p.add_argument("--model-path", default=None,
+                   help="Model weights dir/file the engine serves "
+                        "(omit for a draft-only node)")
     p.add_argument("--model-key", default=None,
                    help="Manifest key (default: basename of model-path)")
     p.add_argument("--engine-url", default="http://127.0.0.1:8000",
                    help="Local engine's OpenAI-compatible base URL")
     p.add_argument("--engine-name", default="freetoken",
                    help="Engine label reported to the coordinator")
+    p.add_argument("--engine-key", default=None,
+                   help="API key for a hosted engine (e.g. Cerebras); "
+                        "injected as a Bearer header on proxied /v1 calls. "
+                        "Falls back to ENGINE_API_KEY env.")
     p.add_argument("--port", type=int, default=8311)
     p.add_argument("--host", default="127.0.0.1",
                    help="Bind address (challenge endpoint only serves "
@@ -117,8 +127,10 @@ def main():
                         "manifest route)")
     args = p.parse_args()
 
-    model_path = os.path.expanduser(args.model_path)
-    model_key = args.model_key or os.path.basename(model_path.rstrip("/"))
+    engine_key = args.engine_key or os.environ.get("ENGINE_API_KEY")
+    model_path = os.path.expanduser(args.model_path) if args.model_path else None
+    model_key = args.model_key or (
+        os.path.basename(model_path.rstrip("/")) if model_path else "draft-only")
 
     if args.write_manifest:
         m = build_manifest(model_path, model_key)
@@ -129,9 +141,10 @@ def main():
               f"/api/yield/manifest with model={model_key!r}")
         return
 
-    index = build_index(model_path)
+    index = build_index(model_path) if model_path else []
     total_gb = sum(s for _, _, s in index) / 1e9
-    print(f"sidecar: {len(index)} chunks / {total_gb:.1f} GB of weights; "
+    role = "weights+draft" if index else "draft-only"
+    print(f"sidecar ({role}): {len(index)} chunks / {total_gb:.1f} GB; "
           f"engine {args.engine_name} at {args.engine_url}")
 
     stats = {"draft_requests": 0}
@@ -144,10 +157,12 @@ def main():
                 self.send_response(404); self.end_headers(); return
             try:
                 n = int(self.headers.get("Content-Length", 0))
+                hdrs = {"Content-Type": "application/json"}
+                if engine_key:
+                    hdrs["Authorization"] = f"Bearer {engine_key}"
                 req = urllib.request.Request(
                     args.engine_url.rstrip("/") + self.path,
-                    data=self.rfile.read(n),
-                    headers={"Content-Type": "application/json"})
+                    data=self.rfile.read(n), headers=hdrs)
                 with urllib.request.urlopen(req, timeout=60) as r:
                     body = r.read()
                 stats["draft_requests"] += 1
@@ -200,6 +215,7 @@ def main():
             "expert_ids": [],
             "est_gb": round(total_gb, 2),
             "engine": args.engine_name,
+            "role": role,
         })
         yc.join()
         yc.start_heartbeat(lambda: {
