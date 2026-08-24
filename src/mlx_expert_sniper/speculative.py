@@ -101,7 +101,8 @@ class RemoteDraft:
         if self.model:  # some servers 404 on unknown ids; omit when unset
             payload["model"] = self.model
         body = _json.dumps(payload).encode()
-        headers = {"Content-Type": "application/json"}
+        headers = {"Content-Type": "application/json",
+                   "User-Agent": "expert-sniper-draft/0.3"}
         if self.api_key:
             headers["Authorization"] = f"Bearer {self.api_key}"
         req = urllib.request.Request(

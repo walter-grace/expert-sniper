@@ -157,7 +157,8 @@ def main():
                 self.send_response(404); self.end_headers(); return
             try:
                 n = int(self.headers.get("Content-Length", 0))
-                hdrs = {"Content-Type": "application/json"}
+                hdrs = {"Content-Type": "application/json",
+                        "User-Agent": "expert-sidecar/0.3"}
                 if engine_key:
                     hdrs["Authorization"] = f"Bearer {engine_key}"
                 req = urllib.request.Request(
