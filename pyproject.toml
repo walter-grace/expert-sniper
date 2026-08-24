@@ -24,6 +24,7 @@ mlx-sniper = "mlx_expert_sniper.cli:main"
 expert-node = "expert_network.node:main"
 expert-net = "expert_network.driver:main"
 expert-sidecar = "expert_network.sidecar:main"
+expert-fetch = "expert_network.fetch_partition:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
