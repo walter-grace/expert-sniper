@@ -201,6 +201,61 @@ def cmd_chat(args):
         messages.append({"role": "assistant", "content": full_response})
 
 
+def cmd_publish(args):
+    """Post a prepared model to the network so other machines can serve it.
+
+    The network's models come from whoever has the disk to prepare them. This
+    hashes every expert block, uploads the manifest under a name you claim,
+    and prints the command other people run to take a slice. Your machine
+    then seeds those blocks to them, which is itself paid work."""
+    import hashlib, json, urllib.request
+    model_dir = os.path.expanduser(args.model_dir)
+    with open(os.path.join(model_dir, "config.json")) as f:
+        config = json.load(f)
+    num_layers = config["num_hidden_layers"]
+    num_experts = (config.get("num_experts") or config.get("n_routed_experts"))
+    key = args.name or f"{num_layers}x{num_experts}"
+    api_key = args.key or os.environ.get("HERO_RUN_KEY")
+    if not api_key:
+        sys.exit("Need a key: --key hr_live_... (or HERO_RUN_KEY)")
+
+    PAGE = 16384
+    blocks, total = {}, 0
+    for li in range(num_layers):
+        path = os.path.join(model_dir, "bin", f"layer_{li:02d}.bin")
+        with open(path, "rb") as f:
+            header = json.loads(f.read(PAGE).rstrip(b"\x00"))
+            bsize = header["layout"]["expert_block_size"]
+            for eid in range(num_experts):
+                f.seek(PAGE + eid * bsize)
+                blocks[f"{li}:{eid}"] = hashlib.sha256(f.read(bsize)).hexdigest()
+                total += bsize
+        print(f"  hashing layer {li + 1}/{num_layers}", end="\r", flush=True)
+    print(f"\n{len(blocks)} blocks, {total / 1e9:.1f} GB")
+
+    manifest = {"model_type": config.get("model_type"), "num_layers": num_layers,
+                "num_experts": num_experts, "expert_block_size": bsize, "blocks": blocks}
+    body = json.dumps({"model": key, "manifest": manifest}).encode()
+    req = urllib.request.Request(f"{args.coordinator}/api/yield/manifest", data=body,
+                                 headers={"Content-Type": "application/json",
+                                          "x-api-key": api_key,
+                                          "User-Agent": "mlx-sniper/0.3"})
+    try:
+        with urllib.request.urlopen(req, timeout=120) as r:
+            out = json.loads(r.read())
+    except urllib.error.HTTPError as e:
+        sys.exit(f"publish failed: {e.read().decode()[:200]}")
+    if out.get("error"):
+        sys.exit(f"publish failed: {out['error']}")
+
+    print(f"\npublished '{key}' — {out.get('blocks')} blocks")
+    print(f"\nOthers join it with:")
+    print(f"  expert-fetch --model {key} --partition <yours> -o ~/models/{key}")
+    print(f"  expert-node --model-dir ~/models/{key} --roster auto --me <id> --join <key>")
+    print(f"\nServe it yourself so there is something to pull from:")
+    print(f"  expert-node --model-dir {model_dir} --roster auto --me $(hostname) --join {api_key[:12]}…")
+
+
 def cmd_manifest(args):
     """Content-address every expert block: manifest.json of sha256 hashes.
 
@@ -307,6 +362,13 @@ def main():
     p = sub.add_parser("manifest", help="Write sha256 manifest of all expert blocks")
     p.add_argument("model_dir", help="Path to sniper model directory")
 
+    # publish — post a prepared model so the rest of the network can serve it
+    p = sub.add_parser("publish", help="Post a prepared model to the network")
+    p.add_argument("model_dir", help="Path to sniper model directory")
+    p.add_argument("--name", default=None, help="model key others will use (default: layersXexperts)")
+    p.add_argument("--key", default=None, help="hr_live_ key (or HERO_RUN_KEY)")
+    p.add_argument("--coordinator", default="https://herorunai.com")
+
     # preprocess
     p = sub.add_parser("preprocess", help="Split a downloaded MLX model into streaming format")
     p.add_argument("src_dir", help="Downloaded MLX model directory")
@@ -338,6 +400,7 @@ def main():
         "eval": cmd_eval,
         "preprocess": cmd_preprocess,
         "manifest": cmd_manifest,
+        "publish": cmd_publish,
     }
     cmds[args.command](args)
 
