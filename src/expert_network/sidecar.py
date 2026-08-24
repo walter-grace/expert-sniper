@@ -34,7 +34,7 @@ import os
 import socket
 import threading
 import urllib.request
-from http.server import HTTPServer, BaseHTTPRequestHandler
+from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 
 from .yield_client import YieldClient
 
@@ -164,7 +164,7 @@ def main():
                 req = urllib.request.Request(
                     args.engine_url.rstrip("/") + self.path,
                     data=self.rfile.read(n), headers=hdrs)
-                with urllib.request.urlopen(req, timeout=60) as r:
+                with urllib.request.urlopen(req, timeout=45) as r:
                     body = r.read()
                 stats["draft_requests"] += 1
                 self.send_response(200)
@@ -224,9 +224,13 @@ def main():
             "draft_requests": stats["draft_requests"],
         })
 
-    HTTPServer.allow_reuse_address = True
-    print(f"serving challenges on http://{args.host}:{args.port}")
-    HTTPServer((args.host, args.port), Handler).serve_forever()
+    # Threaded: a slow draft proxy call must never block the challenge
+    # endpoint — a wedged sidecar reads as an unreachable node and loses
+    # the operator their standing. Daemon threads so ^C still exits.
+    ThreadingHTTPServer.allow_reuse_address = True
+    ThreadingHTTPServer.daemon_threads = True
+    print(f"serving on http://{args.host}:{args.port} ({role})")
+    ThreadingHTTPServer((args.host, args.port), Handler).serve_forever()
 
 
 if __name__ == "__main__":
