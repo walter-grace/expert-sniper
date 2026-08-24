@@ -106,6 +106,9 @@ class OllamaHandler(BaseHTTPRequestHandler):
             self.send_error(500, str(e))
             return
 
+        print(f"[req] {'fast-token' if opts.get('spec') else 'standard'} "
+              f"start: {messages[-1].get('content', '')[:40]!r}", flush=True)
+
         self.send_response(200)
         self.send_header("Content-Type", "application/x-ndjson")
         self._cors()
