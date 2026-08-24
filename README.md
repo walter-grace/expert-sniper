@@ -167,6 +167,19 @@ expert-sidecar --model-path ~/models/GLM-4.6 --write-manifest
 Stdlib-only — no mlx, no extra deps. Expert-partition serving on CUDA
 (the full network tier) is future work; see the issues.
 
+The same sidecar makes the box a **Fast Token draft node**: it proxies
+`/v1/*` to its engine, so fast dense hardware proposes tokens and the
+expert mesh verifies the batch in one forward. Any driver opts in:
+
+```bash
+expert-net ~/models/... --nodes ... --spec --draft-url https://spark1.example.com/v1
+```
+
+Measured over this path (Qwen3-0.6B drafting Qwen3-30B, drafts through
+the sidecar proxy): 4.0 tokens per verify forward at 41% acceptance —
+remote text-level drafting costs a little acceptance vs in-process (56%)
+but frees the draft to run on whatever hardware is fastest at it.
+
 ## Security notes
 
 - `mlx-sniper serve` and the agent CLIs bind `127.0.0.1` by default. There is

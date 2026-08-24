@@ -68,6 +68,54 @@ class ModelDraft:
         return out
 
 
+class RemoteDraft:
+    """Draft over the network: any OpenAI-compatible /v1/completions
+    endpoint proposes the K tokens — a FreeToken box, a DGX Spark, vLLM,
+    or mlx_lm.server. This is the heterogeneous split the network is
+    built for: fast dense hardware proposes, the expert mesh verifies a
+    whole batch in one forward.
+
+    The draft model MUST share the target's tokenizer family. Drafting is
+    text-level (decode tail -> complete -> re-encode), which sidesteps
+    protocol differences; the re-encode is anchored on the decoded tail so
+    boundary tokens resolve consistently under the target tokenizer.
+    """
+
+    def __init__(self, base_url, model, tokenizer, tail_tokens=512,
+                 timeout=20):
+        self.base_url = base_url.rstrip("/")
+        self.model = model
+        self.tokenizer = tokenizer
+        self.tail_tokens = tail_tokens
+        self.timeout = timeout
+        self.requests = 0
+        self.failures = 0
+
+    def __call__(self, context, k, max_ngram=None):
+        import json as _json
+        import urllib.request
+        tail = self.tokenizer.decode(context[-self.tail_tokens:])
+        payload = {"prompt": tail, "max_tokens": k + 4, "temperature": 0}
+        if self.model:  # some servers 404 on unknown ids; omit when unset
+            payload["model"] = self.model
+        body = _json.dumps(payload).encode()
+        req = urllib.request.Request(
+            f"{self.base_url}/completions", data=body,
+            headers={"Content-Type": "application/json"})
+        self.requests += 1
+        try:
+            with urllib.request.urlopen(req, timeout=self.timeout) as r:
+                cont = _json.loads(r.read())["choices"][0].get("text", "")
+        except Exception:
+            self.failures += 1
+            return []  # graceful: this step decodes normally
+        if not cont:
+            return []
+        base_len = len(self.tokenizer.encode(tail))
+        toks = self.tokenizer.encode(tail + cont)
+        return toks[base_len:base_len + k]
+
+
 def spec_generate_stream(engine, messages, bias=0.0, max_tokens=200, k=8,
                          draft=None, stats=None):
     """Generator yielding token strings, speculative version of

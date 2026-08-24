@@ -134,7 +134,32 @@ def main():
     print(f"sidecar: {len(index)} chunks / {total_gb:.1f} GB of weights; "
           f"engine {args.engine_name} at {args.engine_url}")
 
+    stats = {"draft_requests": 0}
+
     class Handler(BaseHTTPRequestHandler):
+        def do_POST(self):
+            # Draft service: forward /v1/* to the local engine so one
+            # public URL serves both custody proofs and Fast Token drafts.
+            if not self.path.startswith("/v1/"):
+                self.send_response(404); self.end_headers(); return
+            try:
+                n = int(self.headers.get("Content-Length", 0))
+                req = urllib.request.Request(
+                    args.engine_url.rstrip("/") + self.path,
+                    data=self.rfile.read(n),
+                    headers={"Content-Type": "application/json"})
+                with urllib.request.urlopen(req, timeout=60) as r:
+                    body = r.read()
+                stats["draft_requests"] += 1
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(body)
+            except Exception as e:
+                self.send_response(502)
+                self.end_headers()
+                self.wfile.write(str(e).encode()[:200])
+
         def do_GET(self):
             parts = self.path.strip("/").split("/")
             if len(parts) == 3 and parts[0] == "block":
@@ -152,6 +177,7 @@ def main():
                     "status": "ok", "engine": args.engine_name,
                     "engine_health": engine_health(args.engine_url),
                     "chunks": len(index), "gb": round(total_gb, 1),
+                    "draft_requests": stats["draft_requests"],
                 }).encode()
                 self.send_response(200)
                 self.send_header("Content-Type", "application/json")
@@ -176,7 +202,10 @@ def main():
             "engine": args.engine_name,
         })
         yc.join()
-        yc.start_heartbeat(lambda: {"engine": engine_health(args.engine_url)})
+        yc.start_heartbeat(lambda: {
+            "engine": engine_health(args.engine_url),
+            "draft_requests": stats["draft_requests"],
+        })
 
     HTTPServer.allow_reuse_address = True
     print(f"serving challenges on http://{args.host}:{args.port}")

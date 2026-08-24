@@ -15,7 +15,7 @@ import time
 
 
 def run(model_dir, nodes, prompt=None, max_tokens=200, chat=False,
-        spec=False, spec_k=8):
+        spec=False, spec_k=8, draft_url=None, draft_model=None):
     from mlx_expert_sniper.generate import load_engine, generate_stream
     from .reader import DistributedExpertReader
 
@@ -36,10 +36,13 @@ def run(model_dir, nodes, prompt=None, max_tokens=200, chat=False,
     def generate(messages):
         spec_stats = {}
         if spec:
-            from mlx_expert_sniper.speculative import spec_generate_stream
+            from mlx_expert_sniper.speculative import (spec_generate_stream,
+                                                       RemoteDraft)
+            dr = (RemoteDraft(draft_url, draft_model,
+                              engine.tokenizer) if draft_url else None)
             stream = spec_generate_stream(engine, messages, bias=0.0,
                                           max_tokens=max_tokens, k=spec_k,
-                                          stats=spec_stats)
+                                          draft=dr, stats=spec_stats)
         else:
             stream = generate_stream(engine, messages, bias=0.0,
                                      max_tokens=max_tokens)
@@ -90,12 +93,16 @@ def main():
     parser.add_argument("--spec", action="store_true",
                         help="Speculative decoding (prompt-lookup drafts)")
     parser.add_argument("--spec-k", type=int, default=8)
+    parser.add_argument("--draft-url", default=None,
+                        help="OpenAI-compatible /v1 base of a remote draft node")
+    parser.add_argument("--draft-model", default=None)
     args = parser.parse_args()
     if not args.chat and not args.prompt:
         parser.error("need --prompt or --chat")
     run(args.model_dir, args.nodes.split(","), prompt=args.prompt,
         max_tokens=args.max_tokens, chat=args.chat,
-        spec=args.spec, spec_k=args.spec_k)
+        spec=args.spec, spec_k=args.spec_k,
+        draft_url=args.draft_url, draft_model=args.draft_model)
 
 
 if __name__ == "__main__":

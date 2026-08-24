@@ -81,9 +81,14 @@ def cmd_run(args):
 
     spec_stats = {}
     if args.spec:
-        from .speculative import spec_generate_stream, ModelDraft
-        draft = (ModelDraft(args.draft_model, eng.tokenizer)
-                 if args.draft_model else None)
+        from .speculative import spec_generate_stream, ModelDraft, RemoteDraft
+        if args.draft_url:
+            draft = RemoteDraft(args.draft_url, args.draft_model,
+                                eng.tokenizer)
+        elif args.draft_model:
+            draft = ModelDraft(args.draft_model, eng.tokenizer)
+        else:
+            draft = None
         stream = spec_generate_stream(eng, messages, bias=bias,
                                       max_tokens=args.max_tokens,
                                       k=args.spec_k, draft=draft,
@@ -280,7 +285,11 @@ def main():
                    help="Speculative decoding (prompt-lookup drafts by default)")
     p.add_argument("--spec-k", type=int, default=8, help="Draft tokens per step")
     p.add_argument("--draft-model", default=None,
-                   help="Tokenizer-compatible draft model path/repo")
+                   help="Tokenizer-compatible draft model path/repo (local), "
+                        "or the model id when using --draft-url")
+    p.add_argument("--draft-url", default=None,
+                   help="OpenAI-compatible /v1 base URL of a remote draft "
+                        "node (a GPU/DGX box on the network)")
 
     # chat
     p = sub.add_parser("chat", help="Interactive multi-turn chat")
