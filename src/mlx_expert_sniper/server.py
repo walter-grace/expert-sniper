@@ -69,7 +69,14 @@ class OllamaHandler(BaseHTTPRequestHandler):
                                 "quantization_level": "Q4_0"},
                 }]
             })
-        elif self.path in ("/api/version", "/"):
+        elif self.path in ("/race", "/"):
+            from .race_page import RACE_HTML
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self._cors()
+            self.end_headers()
+            self.wfile.write(RACE_HTML.encode())
+        elif self.path == "/api/version":
             self._json_response({"version": "0.2.0-sniper"})
         else:
             self.send_response(404)
