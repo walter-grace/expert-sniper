@@ -11,20 +11,35 @@ files (~1 GB for the 30B-class models); the experts live on the nodes. The
 bin/ directory may be absent entirely.
 """
 import argparse
+import os
 import sys
 import time
 
 
 def run(model_dir, nodes, prompt=None, max_tokens=200, chat=False,
-        spec=False, spec_k=8, draft_url=None, draft_model=None):
+        spec=False, spec_k=8, draft_url=None, draft_model=None,
+        hot_cache_gb=0.0):
+    import os
     from mlx_expert_sniper.generate import load_engine, generate_stream
     from .reader import DistributedExpertReader
+    from .node import parse_layer_header
 
     print(f"Loading pinned model from {model_dir}...")
     engine, _, model_type = load_engine(model_dir, pinned_only=True)
 
-    # pinned_only left engine.reader = None; the network is the reader
-    engine.reader = DistributedExpertReader(nodes)
+    # pinned_only left engine.reader = None; the network is the reader.
+    # The hot cache needs the block layout; a pinned-only driver has no
+    # bin/, so it is only available when the driver dir also carries one.
+    layout = None
+    if hot_cache_gb > 0:
+        hdr = os.path.join(os.path.expanduser(model_dir), "bin", "layer_00.bin")
+        if not os.path.exists(hdr):
+            raise SystemExit("--hot-cache-gb needs the block layout: give the driver "
+                             "a model dir that includes bin/layer_00.bin (nodes will "
+                             "serve /layout in a later version)")
+        layout = parse_layer_header(hdr)["layout"]
+    engine.reader = DistributedExpertReader(nodes, hot_cache_gb=hot_cache_gb,
+                                            layout=layout)
     engine.predictor = "none"  # nodes hold everything; nothing to prefetch
 
     print(f"Nodes:")
@@ -98,13 +113,20 @@ def main():
     parser.add_argument("--draft-url", default=None,
                         help="OpenAI-compatible /v1 base of a remote draft node")
     parser.add_argument("--draft-model", default=None)
+    parser.add_argument("--hot-cache-gb", type=float, default=0.0,
+                        help="Driver-side hot-expert cache budget in GB "
+                             "(default 0 = off). Experts pulled from nodes "
+                             "via /block and computed locally when a node's "
+                             "whole active set is cached, skipping its "
+                             "round trip.")
     args = parser.parse_args()
     if not args.chat and not args.prompt:
         parser.error("need --prompt or --chat")
     run(args.model_dir, args.nodes.split(","), prompt=args.prompt,
         max_tokens=args.max_tokens, chat=args.chat,
         spec=args.spec, spec_k=args.spec_k,
-        draft_url=args.draft_url, draft_model=args.draft_model)
+        draft_url=args.draft_url, draft_model=args.draft_model,
+        hot_cache_gb=args.hot_cache_gb)
 
 
 if __name__ == "__main__":

@@ -68,6 +68,13 @@ The driver is pinned-only: its model dir needs just `pinned.safetensors`,
 `config.json` and the tokenizer files (~1 GB for the 30B-class models), no
 `bin/`. Only nodes hold expert layer files, and only for their partition.
 
+`--hot-cache-gb N` gives the driver a bounded hot-expert cache (default off):
+blocks are pulled from nodes over `/block` on a miss, and a node's round
+trip is skipped once every active expert it owns is cached, with its
+partial computed locally by the node's own function (bit-identical output;
+see `expert_network/reader.py`). Unmeasured on hardware so far — a
+projection, not a number.
+
 Nodes bind `127.0.0.1` by default and have no authentication — pass
 `--host 0.0.0.0` only on a trusted network. The decode loop is a LAN/metro
 design (per-layer round trips); the WAN's role is distributing the
