@@ -74,8 +74,8 @@ def cmd_run(args):
         print(f"No calibration found. Run 'mlx-sniper calibrate {args.model_dir}'")
 
     eng, bias_loaded, _ = load_engine(args.model_dir)
-    bias = bias_loaded
-    print(f"Model loaded. Metal: {mx.get_active_memory()/1e9:.2f} GB")
+    bias = bias_loaded if args.bias is None else args.bias
+    print(f"Model loaded. Metal: {mx.get_active_memory()/1e9:.2f} GB  bias={bias}")
 
     messages = [{"role": "user", "content": args.prompt}]
 
@@ -346,6 +346,8 @@ def main():
     p.add_argument("--draft-model", default=None,
                    help="Tokenizer-compatible draft model path/repo (local), "
                         "or the model id when using --draft-url")
+    p.add_argument("--bias", type=float, default=None,
+                   help="Override the calibrated routing bias (0 = none)")
     p.add_argument("--dflash", default=None,
                    help="DFlash block-diffusion draft head for this target "
                         "(path or HF repo, e.g. z-lab/Qwen3-Coder-30B-A3B-DFlash)")
