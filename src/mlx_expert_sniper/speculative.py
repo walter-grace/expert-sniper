@@ -42,29 +42,87 @@ def prompt_lookup_draft(context, k, max_ngram=3):
 
 
 class ModelDraft:
-    """Draft with a smaller tokenizer-compatible model."""
+    """Draft with a smaller tokenizer-compatible model.
 
-    def __init__(self, path_or_repo, target_tokenizer):
-        from mlx_lm import load
-        self.model, self.tokenizer = load(path_or_repo)
-        if self.tokenizer.vocab_size != target_tokenizer.vocab_size:
+    Keeps a persistent KV cache across draft rounds (issue #2). The context
+    is prefilled once; each later round feeds only the tokens that are new
+    since the previous round (the accepted drafts plus the target's
+    correction), then generates K tokens one at a time against the cache.
+    `trim(n)` rolls the cache back over rejected drafts the same way
+    spec_generate_stream rolls the target's; `reset()` starts a fresh
+    generation. As a safety net, every call checks that the cached tokens
+    are a prefix of the context it was handed and drops whatever diverged,
+    so the cached draft always equals the stateless one.
+    """
+
+    def __init__(self, path_or_repo, target_tokenizer, model=None,
+                 tokenizer=None):
+        if model is None:
+            from mlx_lm import load
+            model, tokenizer = load(path_or_repo)
+        self.model, self.tokenizer = model, tokenizer
+        if target_tokenizer is not None and \
+                self.tokenizer.vocab_size != target_tokenizer.vocab_size:
             raise ValueError(
                 f"draft vocab {self.tokenizer.vocab_size} != target "
                 f"{target_tokenizer.vocab_size} — speculation needs a "
                 f"tokenizer-compatible draft model")
+        self.reset()
+
+    def reset(self):
+        """Drop the draft KV cache (start of a new generation)."""
+        from mlx_lm.models.cache import make_prompt_cache
+        self.cache = make_prompt_cache(self.model)
+        self._cached = []      # tokens whose KV the cache currently holds
+        self._pending = 0      # trailing entries of _cached that are drafts
+
+    def _trim_cache(self, n):
+        if n <= 0:
+            return
+        for c in self.cache:
+            c.trim(n)
+        del self._cached[len(self._cached) - n:]
+
+    def trim(self, n):
+        """n of the last round's drafts were rejected: drop the unverified
+        draft positions from the cache. The last draft is never fed
+        through the model, so the cache holds only k-1 of them."""
+        if n <= 0 or not self._pending:
+            return
+        drop = min(self._pending, max(0, n - 1))
+        self._trim_cache(drop)
+        self._pending = 0
+
+    def _sync(self, context):
+        """Make the cache hold exactly a prefix of `context`."""
+        n = 0
+        lim = min(len(self._cached), len(context))
+        while n < lim and self._cached[n] == context[n]:
+            n += 1
+        self._trim_cache(len(self._cached) - n)
+        self._pending = 0
+        return n
 
     def __call__(self, context, k, max_ngram=None):
         import mlx.core as mx
-        # Stateless per call: re-prefill the tail of the context. Cheap for
-        # a sub-1B draft; a persistent draft KV cache is future work.
-        inp = mx.array([context[-512:]])
-        logits = self.model(inp)
+        n = self._sync(context)
+        new = list(context[n:])
+        if not new:
+            # Nothing new since last round (cannot happen from
+            # spec_generate_stream, which always appends the correction);
+            # re-feed the last token so there are logits to read.
+            self._trim_cache(1)
+            new = [context[-1]]
         out = []
-        cur = mx.argmax(logits[:, -1, :], axis=-1)
+        feed = new
         for _ in range(k):
-            out.append(int(cur.item()))
-            logits = self.model(mx.concatenate([inp, mx.array([out])], axis=1))
-            cur = mx.argmax(logits[:, -1, :], axis=-1)
+            logits = self.model(mx.array([feed]), cache=self.cache)
+            self._cached.extend(feed)
+            cur = int(mx.argmax(logits[:, -1, :], axis=-1).item())
+            out.append(cur)
+            feed = [cur]
+        # Cache now holds context + out[:-1]
+        self._pending = max(0, k - 1)
         return out
 
 
@@ -226,6 +284,8 @@ def spec_generate_stream(engine, messages, bias=0.0, max_tokens=200, k=8,
     engine.reset_cache()
     if hasattr(engine, "captured"):
         engine.captured = {}
+    if hasattr(draft, "reset"):
+        draft.reset()
     tok = engine.tokenizer
     try:
         text = tok.apply_chat_template(messages, tokenize=False,
