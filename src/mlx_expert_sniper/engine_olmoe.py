@@ -15,7 +15,8 @@ GROUP_SIZE = 64
 
 
 class MoESniperEngineOlmoe:
-    def __init__(self, cache_size=512, enable_prediction=True):
+    def __init__(self, cache_size=512, enable_prediction=True,
+                 pinned_only=False):
         self.model = None
         self.reader = None
         self.tokenizer = None
@@ -24,6 +25,10 @@ class MoESniperEngineOlmoe:
         self.coact = None
         self._cache_size = cache_size
         self._enable_prediction = enable_prediction
+        # pinned_only: load attention/routing weights but open no
+        # bin/ layer files — the caller installs its own reader
+        # (Expert Network driver). See generate.load_engine.
+        self._pinned_only = pinned_only
 
     def load(self):
         if MODEL_DIR is None:
@@ -90,8 +95,11 @@ class MoESniperEngineOlmoe:
         pinned_gb = sum(p.nbytes for p in params) / 1e9
         streaming = config.get("streaming", {"expert_dir": "bin"})
         expert_dir = os.path.join(MODEL_DIR, streaming["expert_dir"])
-        self.reader = MoEExpertReader(expert_dir, self.num_layers,
-                                      num_workers=8, cache_size=self._cache_size)
+        if self._pinned_only:
+            self.reader = None  # caller installs one; bin/ need not exist
+        else:
+            self.reader = MoEExpertReader(expert_dir, self.num_layers,
+                                          num_workers=8, cache_size=self._cache_size)
         self.coact = CoActivationTracker(self.num_layers, warmup_tokens=3)
 
         from transformers import AutoTokenizer

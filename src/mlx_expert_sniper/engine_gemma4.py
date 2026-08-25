@@ -79,7 +79,8 @@ def run_expert_ffn_gemma4(x, expert_data, top_k_indices, top_k_weights,
 
 
 class MoESniperEngineGemma4:
-    def __init__(self, cache_size=3000, enable_prediction=True):
+    def __init__(self, cache_size=3000, enable_prediction=True,
+                 pinned_only=False):
         self.model = None
         self.reader = None
         self.tokenizer = None
@@ -88,6 +89,10 @@ class MoESniperEngineGemma4:
         self.coact = None
         self._cache_size = cache_size
         self._enable_prediction = enable_prediction
+        # pinned_only: load attention/routing weights but open no
+        # bin/ layer files — the caller installs its own reader
+        # (Expert Network driver). See generate.load_engine.
+        self._pinned_only = pinned_only
         self.per_expert_scales = {}  # layer -> [128] float array
 
     def load(self):
@@ -164,11 +169,15 @@ class MoESniperEngineGemma4:
 
         # Load expert reader
         expert_dir = os.path.join(MODEL_DIR, streaming.get("expert_dir", "bin"))
-        self.reader = MoEExpertReader(expert_dir, self.num_layers,
-                                       num_workers=8, cache_size=self._cache_size)
+        if self._pinned_only:
+            self.reader = None  # caller installs one; bin/ need not exist
+        else:
+            self.reader = MoEExpertReader(expert_dir, self.num_layers,
+                                           num_workers=8, cache_size=self._cache_size)
 
-        # Load per-expert scales from bin headers
-        for li in range(self.num_layers):
+        # Load per-expert scales from bin headers (a pinned-only load
+        # has no headers to read; the scales stay empty)
+        for li in range(self.num_layers if self.reader else 0):
             header = self.reader.headers[li]
             if "per_expert_scale" in header:
                 self.per_expert_scales[li] = header["per_expert_scale"]

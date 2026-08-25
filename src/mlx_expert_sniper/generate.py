@@ -23,14 +23,24 @@ def eos_token_ids(tok):
     return ids
 
 
-def load_engine(model_dir):
-    """Load engine with calibration. Returns (engine, bias, model_type)."""
+def load_engine(model_dir, pinned_only=False):
+    """Load engine with calibration. Returns (engine, bias, model_type).
+
+    pinned_only=True loads only the pinned weights (pinned.safetensors +
+    config.json + tokenizer) and opens no bin/ layer files: engine.reader is
+    None and the caller installs its own. This is what the Expert Network
+    driver needs — attention/routing are local, experts live on the nodes —
+    so a driver machine holds ~1 GB, not the whole streaming model dir.
+    Calibration is skipped too (cache sizing reads a bin/ header, and the
+    driver has no SSD cache to size).
+    """
     os.environ["TOKENIZERS_PARALLELISM"] = "false"
     import mlx.core as mx
     from .calibrate import load_calibration, auto_size_cache, _detect_model_type
 
-    cal = load_calibration(model_dir)
-    if cal:
+    if pinned_only:
+        cache_size, bias = 0, 0.0
+    elif (cal := load_calibration(model_dir)):
         cache_size = cal["cache_size"]
         bias = cal["routing_bias"]
     else:
@@ -59,7 +69,8 @@ def load_engine(model_dir):
         engine_mod.MODEL_DIR = model_dir
         from .engine_30b import MoESniperEngine30B as EngineClass
 
-    eng = EngineClass(cache_size=cache_size, enable_prediction=True)
+    eng = EngineClass(cache_size=cache_size, enable_prediction=True,
+                      pinned_only=pinned_only)
     eng.load()
     return eng, bias, model_type
 

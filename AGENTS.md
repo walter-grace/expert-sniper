@@ -39,7 +39,7 @@ setting. Use `mlx-sniper eval --decode`.
 
 ```bash
 pip install -e ".[network]" pytest
-python -m pytest tests/ -q          # 15 tests, no model needed
+python -m pytest tests/ -q          # 18 tests, no model needed
 mlx-sniper download olmoe-1b-7b -o ~/models/olmoe-stream   # 3.6 GB demo
 ```
 
