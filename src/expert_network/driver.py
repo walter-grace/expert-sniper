@@ -1,13 +1,14 @@
 """Expert Network driver — attention/routing local, experts remote.
 
-Loads the pinned weights through the standard engine, then swaps the SSD
-reader for the distributed one. The SAME forward pass as single-machine
-serving (generate.make_forward) drives the network via its remote-compute
-hook, so improvements and measurements apply to both tiers.
+Loads the pinned weights through the standard engine (pinned_only=True, so
+no bin/ layer file is opened), then installs the distributed reader. The
+SAME forward pass as single-machine serving (generate.make_forward) drives
+the network via its remote-compute hook, so improvements and measurements
+apply to both tiers.
 
-v1 limitation: the driver machine needs the full streaming model dir
-(pinned + bin/) even though it never reads bin/ — engine loading is shared
-with the single-machine path. Splitting pinned-only loading is future work.
+A driver machine needs only pinned.safetensors + config.json + tokenizer
+files (~1 GB for the 30B-class models); the experts live on the nodes. The
+bin/ directory may be absent entirely.
 """
 import argparse
 import sys
@@ -20,10 +21,9 @@ def run(model_dir, nodes, prompt=None, max_tokens=200, chat=False,
     from .reader import DistributedExpertReader
 
     print(f"Loading pinned model from {model_dir}...")
-    engine, _, model_type = load_engine(model_dir)
+    engine, _, model_type = load_engine(model_dir, pinned_only=True)
 
-    # Swap the SSD reader for the network
-    engine.reader.close()
+    # pinned_only left engine.reader = None; the network is the reader
     engine.reader = DistributedExpertReader(nodes)
     engine.predictor = "none"  # nodes hold everything; nothing to prefetch
 
@@ -83,7 +83,9 @@ def run(model_dir, nodes, prompt=None, max_tokens=200, chat=False,
 
 def main():
     parser = argparse.ArgumentParser(description="Expert Network driver")
-    parser.add_argument("model_dir", help="Streaming model dir (pinned + config)")
+    parser.add_argument("model_dir",
+                        help="Model dir with pinned.safetensors + config.json "
+                             "+ tokenizer (bin/ not needed)")
     parser.add_argument("--nodes", required=True,
                         help="Comma-separated node URLs, e.g. "
                              "http://127.0.0.1:8301,http://127.0.0.1:8302")

@@ -64,6 +64,10 @@ expert-node --model-dir ~/models/olmoe-stream --roster mini-a,mini-b --me mini-b
 expert-net ~/models/olmoe-stream --nodes http://127.0.0.1:8301,http://127.0.0.1:8302 --chat
 ```
 
+The driver is pinned-only: its model dir needs just `pinned.safetensors`,
+`config.json` and the tokenizer files (~1 GB for the 30B-class models), no
+`bin/`. Only nodes hold expert layer files, and only for their partition.
+
 Nodes bind `127.0.0.1` by default and have no authentication — pass
 `--host 0.0.0.0` only on a trusted network. The decode loop is a LAN/metro
 design (per-layer round trips); the WAN's role is distributing the
