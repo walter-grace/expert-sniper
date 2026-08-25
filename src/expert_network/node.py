@@ -36,14 +36,14 @@ def parse_layer_header(layer_path):
     return json.loads(raw.rstrip(b"\x00"))
 
 
-def load_expert_from_bin(fd, expert_id, layout, tensor_layout):
+def parse_expert_block(raw, tensor_layout):
+    """Raw expert block bytes -> {tensor name: mx.array}. Shared by the node's
+    partition loader and the driver's hot cache so both hold the same arrays."""
     import mlx.core as mx
     MLX_DTYPES = {
         "uint32": mx.uint32, "float16": mx.float16,
         "float32": mx.float32, "bfloat16": mx.bfloat16,
     }
-    offset = layout["data_start"] + expert_id * layout["expert_block_size"]
-    raw = os.pread(fd, layout["expert_block_size"], offset)
     result = {}
     for name, info in tensor_layout.items():
         arr_bytes = raw[info["inner_offset"]:info["inner_offset"] + info["nbytes"]]
@@ -51,6 +51,12 @@ def load_expert_from_bin(fd, expert_id, layout, tensor_layout):
         flat = mx.array(np.frombuffer(arr_bytes, dtype=np.uint8))
         result[name] = flat.view(dtype).reshape(info["shape_per_expert"])
     return result
+
+
+def load_expert_from_bin(fd, expert_id, layout, tensor_layout):
+    offset = layout["data_start"] + expert_id * layout["expert_block_size"]
+    raw = os.pread(fd, layout["expert_block_size"], offset)
+    return parse_expert_block(raw, tensor_layout)
 
 
 def _available_ram_gb():
@@ -133,6 +139,39 @@ def compute_expert_ffn(x, expert_data_list, local_indices, top_k_weights):
     return (out * top_k_weights[..., None]).sum(axis=-2)
 
 
+def compute_partial(experts, partition_set, num_experts, layer_idx, req_ids,
+                    h_np, inds_np, weights_np):
+    """One node's partial for a request: the FFN over the requested experts it
+    owns (and has loaded), weights masked to its partition, cast to float16.
+
+    Module-level so the driver's hot-expert cache runs the SAME function over
+    the SAME expert set and gets a bit-identical partial (see reader.py).
+    Returns (n_computed, float16 ndarray shaped like h_np)."""
+    import mlx.core as mx
+    # Experts this node owns AND actually has loaded for this layer —
+    # one set, so local indices can never silently point at the wrong
+    # expert.
+    my_ids = sorted(eid for eid in req_ids
+                    if eid in partition_set and (layer_idx, eid) in experts)
+    if not my_ids:
+        return 0, np.zeros(h_np.shape, dtype=np.float16)
+
+    partition_arr = np.zeros(num_experts, dtype=bool)
+    partition_arr[list(partition_set)] = True
+    # Vectorized lookup table instead of a per-element Python loop.
+    lut = np.zeros(num_experts, dtype=np.int32)
+    lut[my_ids] = np.arange(len(my_ids), dtype=np.int32)
+    local_indices = mx.array(lut[inds_np])
+    mask = partition_arr[inds_np].astype(np.float32)
+    masked_weights = mx.array(weights_np) * mx.array(mask)
+
+    expert_data_list = [(eid, experts[(layer_idx, eid)]) for eid in my_ids]
+    result = compute_expert_ffn(mx.array(h_np), expert_data_list,
+                                local_indices, masked_weights)
+    mx.eval(result)
+    return len(my_ids), np.array(result.astype(mx.float16))
+
+
 def create_app(experts, expert_ids, num_layers, num_experts, model_dir=None):
     from fastapi import FastAPI, Request
     from fastapi.responses import Response
@@ -141,31 +180,11 @@ def create_app(experts, expert_ids, num_layers, num_experts, model_dir=None):
     app = FastAPI(title="Expert Network Node")
     expert_dir = os.path.join(model_dir, "bin") if model_dir else None
     partition_set = set(expert_ids)
-    partition_arr = np.zeros(num_experts, dtype=bool)
-    partition_arr[list(partition_set)] = True
     stats = {"count": 0, "time": 0.0}
 
     def compute(layer_idx, req_ids, h_np, inds_np, weights_np):
-        # Experts this node owns AND actually has loaded for this layer —
-        # one set, so local indices can never silently point at the wrong
-        # expert.
-        my_ids = sorted(eid for eid in req_ids
-                        if eid in partition_set and (layer_idx, eid) in experts)
-        if not my_ids:
-            return 0, np.zeros(h_np.shape, dtype=np.float16)
-
-        # Vectorized lookup table instead of a per-element Python loop.
-        lut = np.zeros(num_experts, dtype=np.int32)
-        lut[my_ids] = np.arange(len(my_ids), dtype=np.int32)
-        local_indices = mx.array(lut[inds_np])
-        mask = partition_arr[inds_np].astype(np.float32)
-        masked_weights = mx.array(weights_np) * mx.array(mask)
-
-        expert_data_list = [(eid, experts[(layer_idx, eid)]) for eid in my_ids]
-        result = compute_expert_ffn(mx.array(h_np), expert_data_list,
-                                    local_indices, masked_weights)
-        mx.eval(result)
-        return len(my_ids), np.array(result.astype(mx.float16))
+        return compute_partial(experts, partition_set, num_experts, layer_idx,
+                               req_ids, h_np, inds_np, weights_np)
 
     @app.post("/compute_bin")
     async def compute_bin(request: Request):
@@ -198,6 +217,14 @@ def create_app(experts, expert_ids, num_layers, num_experts, model_dir=None):
         finally:
             os.close(fd)
         return Response(content=raw, media_type="application/octet-stream")
+
+    @app.get("/partition")
+    async def partition():
+        """Full expert-id list this node serves. /health truncates the list;
+        the driver's hot-expert cache needs the whole partition to know which
+        node a round trip can be skipped for."""
+        return {"expert_ids": sorted(partition_set), "num_layers": num_layers,
+                "num_experts": num_experts}
 
     @app.get("/health")
     async def health():

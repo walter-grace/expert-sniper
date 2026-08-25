@@ -15,16 +15,24 @@ import time
 
 
 def run(model_dir, nodes, prompt=None, max_tokens=200, chat=False,
-        spec=False, spec_k=8, draft_url=None, draft_model=None):
+        spec=False, spec_k=8, draft_url=None, draft_model=None,
+        hot_cache_gb=0.0):
+    import os
     from mlx_expert_sniper.generate import load_engine, generate_stream
     from .reader import DistributedExpertReader
+    from .node import parse_layer_header
 
     print(f"Loading pinned model from {model_dir}...")
     engine, _, model_type = load_engine(model_dir)
 
     # Swap the SSD reader for the network
     engine.reader.close()
-    engine.reader = DistributedExpertReader(nodes)
+    layout = None
+    if hot_cache_gb > 0:
+        layout = parse_layer_header(os.path.join(
+            os.path.expanduser(model_dir), "bin", "layer_00.bin"))["layout"]
+    engine.reader = DistributedExpertReader(nodes, hot_cache_gb=hot_cache_gb,
+                                            layout=layout)
     engine.predictor = "none"  # nodes hold everything; nothing to prefetch
 
     print(f"Nodes:")
@@ -96,13 +104,20 @@ def main():
     parser.add_argument("--draft-url", default=None,
                         help="OpenAI-compatible /v1 base of a remote draft node")
     parser.add_argument("--draft-model", default=None)
+    parser.add_argument("--hot-cache-gb", type=float, default=0.0,
+                        help="Driver-side hot-expert cache budget in GB "
+                             "(default 0 = off). Experts pulled from nodes "
+                             "via /block and computed locally when a node's "
+                             "whole active set is cached, skipping its "
+                             "round trip.")
     args = parser.parse_args()
     if not args.chat and not args.prompt:
         parser.error("need --prompt or --chat")
     run(args.model_dir, args.nodes.split(","), prompt=args.prompt,
         max_tokens=args.max_tokens, chat=args.chat,
         spec=args.spec, spec_k=args.spec_k,
-        draft_url=args.draft_url, draft_model=args.draft_model)
+        draft_url=args.draft_url, draft_model=args.draft_model,
+        hot_cache_gb=args.hot_cache_gb)
 
 
 if __name__ == "__main__":
