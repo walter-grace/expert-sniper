@@ -570,9 +570,13 @@ class MoEExpertReader:
 
     def close(self):
         self.reset_prefetch()
-        self.executor.shutdown(wait=False)
-        self.backfill_executor.shutdown(wait=False)
-        for fd in self.fds.values():
+        # Wait for in-flight workers: a prefetch task can lazily open a new
+        # layer fd while we are closing the others, which is a "dictionary
+        # changed size during iteration" on the fd table (seen in CI).
+        self.executor.shutdown(wait=True, cancel_futures=True)
+        self.backfill_executor.shutdown(wait=True, cancel_futures=True)
+        for fd in list(self.fds.values()):
             os.close(fd)
+        self.fds.clear()
         if self.fallback:
             self.fallback.close()
