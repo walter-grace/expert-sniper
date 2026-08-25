@@ -25,7 +25,9 @@ import argparse
 import hashlib
 import json
 import os
+import random
 import sys
+import threading
 import time
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
@@ -55,25 +57,208 @@ def parse_partition(spec, num_experts):
     return [int(x) for x in spec.split(",") if x.strip() != ""]
 
 
-def fetch_block(peers, layer, eid, want_hash, tries=3):
-    """Pull one expert block, trying peers in order. Verified or nothing.
+class PeerRanker:
+    """Peers ranked by *measured* throughput, not by the coordinator's order.
 
-    Returns the peer that served it so the caller can credit them: seeding is
-    paid work, and the receiver is the only party that knows what actually
-    arrived intact."""
+    Every successful transfer updates a per-peer MB/s estimate (EWMA), every
+    failure halves it. Dispatch draws peers at random weighted by that
+    estimate, with a floor so a slow peer still takes a small share of the
+    load instead of sitting idle: that keeps the pull spread across the
+    swarm, and keeps fresh measurements coming in for every peer."""
+
+    FLOOR = 0.1     # slowest peer gets at least 10% of the fastest's weight
+    ALPHA = 0.3     # EWMA weight of the newest measurement
+
+    def __init__(self, peers, seed=None):
+        self.peers = list(peers)
+        self.speed = {p["nodeId"]: None for p in self.peers}   # MB/s
+        self._lock = threading.Lock()
+        self._rng = random.Random(seed)
+
+    def probe(self, layer, eid, want_hash, timeout=60):
+        """One timed block fetch per peer. Returns {nodeId: (data|None, sec)}.
+
+        A real block is the throughput signal we care about; /health only
+        measures latency. Peers that fail or serve a bad hash are ranked
+        last (speed 0) but not dropped: they may recover mid-pull."""
+        results = {}
+        for peer in self.peers:
+            t = time.time()
+            try:
+                data = _get(f"{peer['url'].rstrip('/')}/block/{layer}/{eid}",
+                            timeout=timeout, binary=True)
+                sec = max(1e-6, time.time() - t)
+                if want_hash and hashlib.sha256(data).hexdigest() != want_hash:
+                    raise ValueError("hash mismatch")
+                self.speed[peer["nodeId"]] = len(data) / 1e6 / sec
+                results[peer["nodeId"]] = (data, sec)
+            except Exception:
+                self.speed[peer["nodeId"]] = 0.0
+                results[peer["nodeId"]] = (None, time.time() - t)
+        return results
+
+    def record(self, node_id, nbytes, sec):
+        mbps = nbytes / 1e6 / max(1e-6, sec)
+        with self._lock:
+            old = self.speed.get(node_id)
+            self.speed[node_id] = mbps if not old else (
+                (1 - self.ALPHA) * old + self.ALPHA * mbps)
+
+    def penalize(self, node_id):
+        with self._lock:
+            self.speed[node_id] = (self.speed.get(node_id) or 0.0) / 2
+
+    def order(self):
+        """Peers in dispatch order: a weighted draw without replacement, so
+        the first choice is usually the fastest peer and failover walks the
+        rest, also fastest-first on average."""
+        with self._lock:
+            speeds = {n: (s or 0.0) for n, s in self.speed.items()}
+            best = max(speeds.values(), default=0.0)
+            remaining = list(self.peers)
+            if best <= 0:
+                self._rng.shuffle(remaining)
+                return remaining
+            weights = {n: max(s, best * self.FLOOR) for n, s in speeds.items()}
+            out = []
+            while remaining:
+                pick = self._rng.choices(
+                    remaining, weights=[weights[p["nodeId"]] for p in remaining])[0]
+                remaining.remove(pick)
+                out.append(pick)
+            return out
+
+    def table(self):
+        rows = sorted(self.peers, key=lambda p: -(self.speed[p["nodeId"]] or 0))
+        return "\n".join(
+            f"  {p['nodeId'][:24]:<24} "
+            + (f"{self.speed[p['nodeId']]:8.1f} MB/s"
+               if self.speed[p["nodeId"]] else "    failed")
+            for p in rows)
+
+
+def fetch_block(ranker, layer, eid, want_hash, tries=3):
+    """Pull one expert block, fastest peers first. Verified or nothing.
+
+    Returns (data, peer) so the caller can credit the peer that served it:
+    seeding is paid work, and the receiver is the only party that knows
+    what actually arrived intact."""
     last = None
+    order = ranker.order()
     for attempt in range(tries):
-        peer = peers[(attempt + layer + eid) % len(peers)]
+        peer = order[attempt % len(order)]
+        t = time.time()
         try:
             data = _get(f"{peer['url'].rstrip('/')}/block/{layer}/{eid}",
                         timeout=60, binary=True)
             if want_hash and hashlib.sha256(data).hexdigest() != want_hash:
                 last = f"hash mismatch from {peer['nodeId']}"
+                ranker.penalize(peer["nodeId"])
                 continue
+            ranker.record(peer["nodeId"], len(data), time.time() - t)
             return data, peer
         except Exception as e:
             last = f"{peer['nodeId']}: {type(e).__name__}"
+            ranker.penalize(peer["nodeId"])
     raise RuntimeError(f"block {layer}:{eid} unavailable ({last})")
+
+
+def _have_block(fd, offset, size, want_hash):
+    """True if the bytes already at this block's fixed offset verify.
+
+    Only our own offsets are ever read; the holes belonging to other
+    machines' experts are never touched."""
+    if not want_hash:
+        return False
+    try:
+        raw = os.pread(fd, size, offset)
+    except OSError:
+        return False
+    return len(raw) == size and hashlib.sha256(raw).hexdigest() == want_hash
+
+
+def fetch_partition(out, blocks, mine, num_layers, num_experts, block_size,
+                    peers, jobs=6, tensors=None, log=print, seed=None):
+    """Pull every (layer, expert) in `mine` into sparse layer files under
+    `out/bin`, skipping blocks the files already hold intact.
+
+    Returns a stats dict: fetched, skipped, bytes (delivered this run),
+    seconds, delivered ({nodeId: bytes}; only bytes that actually arrived
+    this run, so skipped blocks credit nobody), speeds ({nodeId: MB/s})."""
+    os.makedirs(os.path.join(out, "bin"), exist_ok=True)
+    ranker = PeerRanker(peers, seed=seed)
+    total = len(mine) * num_layers
+    stats = {"fetched": 0, "skipped": 0, "bytes": 0, "delivered": {}}
+    t0 = time.time()
+    probed = False
+
+    def credit(peer, n):
+        stats["delivered"][peer["nodeId"]] = stats["delivered"].get(peer["nodeId"], 0) + n
+        stats["bytes"] += n
+
+    for layer in range(num_layers):
+        path = os.path.join(out, "bin", f"layer_{layer:02d}.bin")
+        header = {"layer_idx": layer, "num_experts": num_experts,
+                  "layout": {"expert_block_size": block_size,
+                             "data_start": PAGE_SIZE, "tensors": tensors}}
+        hj = json.dumps(header).encode()
+        size = PAGE_SIZE + num_experts * block_size
+        # r+b keeps a previous run's blocks; "wb" would truncate them away.
+        exists = os.path.exists(path) and os.path.getsize(path) == size
+        with open(path, "r+b" if exists else "wb") as f:
+            fd = f.fileno()
+            os.pwrite(fd, hj + b"\x00" * (PAGE_SIZE - len(hj)), 0)
+            if not exists:
+                # sparse: sizing the file to the full layout leaves holes
+                # where other machines' experts live, so the engine's fixed
+                # offsets still land while the disk only holds our slice.
+                f.truncate(size)
+
+            todo = []
+            for eid in mine:
+                want = blocks.get(f"{layer}:{eid}")
+                if _have_block(fd, PAGE_SIZE + eid * block_size, block_size, want):
+                    stats["skipped"] += 1
+                else:
+                    todo.append(eid)
+
+            if todo and not probed:
+                # the first block we actually need doubles as the probe:
+                # every peer serves it once, timed, and the fastest copy is
+                # the one that lands on disk.
+                probed = True
+                eid = todo[0]
+                res = ranker.probe(layer, eid, blocks.get(f"{layer}:{eid}"))
+                log("peer speeds (probe, one block each):")
+                log(ranker.table())
+                got = None
+                for peer in peers:
+                    data, _ = res.get(peer["nodeId"], (None, 0))
+                    if data is not None:
+                        credit(peer, len(data))
+                        got = data
+                if got is not None:
+                    os.pwrite(fd, got, PAGE_SIZE + eid * block_size)
+                    stats["fetched"] += 1
+                    todo = todo[1:]
+
+            def one(eid):
+                data, peer = fetch_block(ranker, layer, eid, blocks.get(f"{layer}:{eid}"))
+                return eid, data, peer
+
+            with ThreadPoolExecutor(max_workers=max(1, jobs)) as pool:
+                for eid, data, peer in pool.map(one, todo):
+                    os.pwrite(fd, data, PAGE_SIZE + eid * block_size)
+                    credit(peer, len(data))
+                    stats["fetched"] += 1
+            done = stats["fetched"] + stats["skipped"]
+            rate = stats["bytes"] / 1e6 / max(0.1, time.time() - t0)
+            log(f"  layer {layer + 1}/{num_layers}  {done}/{total} blocks  "
+                f"({stats['skipped']} already had)  {rate:.0f} MB/s", end="\r", flush=True)
+
+    stats["seconds"] = time.time() - t0
+    stats["speeds"] = dict(ranker.speed)
+    return stats
 
 
 def main():
@@ -123,35 +308,10 @@ def main():
           f"{' …' if len(peers) > 4 else ''}\n")
 
     # --- pull, verify, write sparse ---------------------------------------
-    done = 0
-    delivered = {}
-    t0 = time.time()
-    for layer in range(num_layers):
-        path = os.path.join(out, "bin", f"layer_{layer:02d}.bin")
-        header = {"layer_idx": layer, "num_experts": num_experts,
-                  "layout": {"expert_block_size": block_size,
-                             "data_start": PAGE_SIZE, "tensors": manifest.get("tensors")}}
-        hj = json.dumps(header).encode()
-        with open(path, "wb") as f:
-            f.write(hj + b"\x00" * (PAGE_SIZE - len(hj)))
-            # sparse: sizing the file to the full layout leaves holes where
-            # other machines' experts live, so the engine's fixed offsets
-            # still land correctly while the disk only holds our slice.
-            f.truncate(PAGE_SIZE + num_experts * block_size)
-
-            def one(eid):
-                data, peer = fetch_block(peers, layer, eid, blocks.get(f"{layer}:{eid}"))
-                return eid, data, peer
-
-            with ThreadPoolExecutor(max_workers=args.jobs) as pool:
-                for eid, data, peer in pool.map(one, mine):
-                    f.seek(PAGE_SIZE + eid * block_size)
-                    f.write(data)
-                    delivered[peer["nodeId"]] = delivered.get(peer["nodeId"], 0) + len(data)
-                    done += 1
-            rate = done * block_size / 1e6 / max(0.1, time.time() - t0)
-            print(f"  layer {layer + 1}/{num_layers}  {done}/{total} blocks  "
-                  f"{rate:.0f} MB/s", end="\r", flush=True)
+    stats = fetch_partition(out, blocks, mine, num_layers, num_experts, block_size,
+                            peers, jobs=args.jobs, tensors=manifest.get("tensors"))
+    delivered = stats["delivered"]
+    done = stats["fetched"] + stats["skipped"]
 
     real = sum(os.stat(os.path.join(out, "bin", f)).st_blocks * 512
                for f in os.listdir(os.path.join(out, "bin")))
@@ -175,7 +335,13 @@ def main():
             print(f"\n\ncould not credit seeders ({type(e).__name__}) — "
                   f"they served you anyway")
 
-    print(f"\n{done} blocks verified and written in {time.time() - t0:.0f}s")
+    secs = stats["seconds"]
+    print(f"\n{done} blocks verified in {secs:.0f}s: {stats['fetched']} fetched, "
+          f"{stats['skipped']} already had")
+    print(f"downloaded {stats['bytes'] / 1e6:.0f} MB at "
+          f"{stats['bytes'] / 1e6 / max(0.1, secs):.1f} MB/s")
+    for n, b in sorted(delivered.items(), key=lambda kv: -kv[1]):
+        print(f"  {n[:24]:<24} {b / 1e6:8.0f} MB")
     print(f"on disk: {real / 1e9:.1f} GB (sparse)")
     print(f"\nNext: copy pinned.safetensors + config.json from a peer or the "
           f"source repo, then:\n  expert-node --model-dir {out} "
