@@ -51,7 +51,7 @@ TINY = dict(
     hc_count=4,
     hc_lowrank=8,
     ple_layer_ids=[1],
-    ple_embed_dim=64,
+    ple_embed_dim=128,  # 4 n-gram heads x 32 (quantizable head dim)
     ple_conv_kernel_size=4,
     ngram_size=3,
     heads_per_ngram=2,
@@ -311,3 +311,210 @@ def test_engine_forward_matches_model(tmp_path, monkeypatch):
         d = np.abs(g - r).max()
         print(f"engine vs model max|diff|={d:.3e}")
         assert d < 1e-4
+
+
+# --------------------------------------------------------------------------- #
+# Streamed n-gram sources: Disk / HF rows == in-memory shards
+# --------------------------------------------------------------------------- #
+
+def _quantized_shards(num_shards=4, rows=24, dim=64, gs=32, bits=4):
+    """Random in-memory quantized shard module + raw row files geometry."""
+    from mlx_expert_sniper.models.qwen4_exp import NGramShards, InMemoryNGramSource
+    shards = NGramShards(num_shards, rows, dim)
+    nn.quantize(shards, group_size=gs, bits=bits)
+    mx.eval(shards.parameters())
+    return shards, InMemoryNGramSource(shards, rows)
+
+
+def _write_ngram_dir(shards, d, num_shards, rows, dim, gs, bits):
+    os.makedirs(d, exist_ok=True)
+    layout = {"tensors": {}}
+    for i in range(num_shards):
+        m = getattr(shards, f"shard_{i}")
+        for kind, dt in (("weight", "U32"), ("scales", "BF16"), ("biases", "BF16")):
+            t = m[kind]
+            b = np.array(t.view(mx.uint16) if t.dtype == mx.bfloat16 else t).tobytes()
+            local = f"shard_{i}.{kind}"
+            with open(os.path.join(d, local), "wb") as f:
+                f.write(b)
+            layout["tensors"][local] = {"shape": list(t.shape), "dtype": dt,
+                                        "row_bytes": len(b) // t.shape[0], "file": local,
+                                        "source": f"language_model.model.layers.0.ple.ple_embedding.ngram_embedding.{local}"}
+    with open(os.path.join(d, "layout.json"), "w") as f:
+        json.dump(layout, f)
+    return layout
+
+
+def test_disk_ngram_source_matches_memory(tmp_path):
+    from mlx_expert_sniper.ngram_source import DiskNGramSource
+    mx.random.seed(1)
+    ns, rows, dim, gs, bits = 4, 24, 64, 32, 4
+    shards, mem = _quantized_shards(ns, rows, dim, gs, bits)
+    # scales/biases are fp32 in a float model; cast to bf16 like the checkpoint
+    for i in range(ns):
+        m = getattr(shards, f"shard_{i}")
+        m.scales, m.biases = m.scales.astype(mx.bfloat16), m.biases.astype(mx.bfloat16)
+    _write_ngram_dir(shards, str(tmp_path / "ngram"), ns, rows, dim, gs, bits)
+    disk = DiskNGramSource(str(tmp_path / "ngram"), gs, bits)
+    assert disk.rows_per_shard == rows and disk.num_shards == ns
+    ids = mx.array(np.random.RandomState(0).randint(0, ns * rows, size=(2, 5, 3)))
+    a, b = np.array(mem.lookup(ids).astype(mx.float32)), np.array(disk.lookup(ids).astype(mx.float32))
+    assert a.shape == (2, 5, 3, dim) and np.abs(a - b).max() < 1e-6
+    # second lookup is served from the LRU
+    n = disk.reads
+    mx.eval(disk.lookup(ids))
+    assert disk.reads == n and disk.lru.hits > 0
+    disk.close()
+
+
+def test_hf_ngram_source_matches_memory(tmp_path, monkeypatch):
+    from mlx_expert_sniper.ngram_source import HFNGramSource
+    mx.random.seed(2)
+    ns, rows, dim, gs, bits = 4, 24, 64, 32, 4
+    shards, mem = _quantized_shards(ns, rows, dim, gs, bits)
+    for i in range(ns):
+        m = getattr(shards, f"shard_{i}")
+        m.scales, m.biases = m.scales.astype(mx.bfloat16), m.biases.astype(mx.bfloat16)
+    layout = _write_ngram_dir(shards, str(tmp_path / "ngram"), ns, rows, dim, gs, bits)
+    # a fake checkpoint: every tensor lives at a distinct offset of one "shard file"
+    blob, loc = bytearray(), {}
+    for local, m in layout["tensors"].items():
+        data = open(tmp_path / "ngram" / local, "rb").read()
+        loc[m["source"]] = ("model-00001.safetensors", m["dtype"], m["shape"], len(blob), len(blob) + len(data))
+        blob += data
+
+    class FakeHF:
+        prefix = "language_model.model."
+        repo = "fake/repo"
+        def __init__(self):
+            self.requests = []
+        def ngram_names(self):
+            return sorted(loc)
+        def locate(self, name):
+            return loc[name]
+        def read_range(self, shard, s, e):
+            self.requests.append((s, e))
+            return bytes(blob[s:e + 1])
+    hf = FakeHF()
+    src = HFNGramSource(hf, layer_idx=0, group_size=gs, bits=bits, coalesce_bytes=64)
+    ids = mx.array(np.random.RandomState(1).randint(0, ns * rows, size=(1, 7, 3)))
+    a, b = np.array(mem.lookup(ids).astype(mx.float32)), np.array(src.lookup(ids).astype(mx.float32))
+    assert np.abs(a - b).max() < 1e-6
+    # adjacent rows were coalesced: fewer requests than rows*kinds
+    n_rows = len(np.unique(np.array(ids)))
+    assert 0 < len(hf.requests) < 3 * n_rows or n_rows <= 2
+    # consecutive ids -> one request per kind
+    hf.requests.clear()
+    src2 = HFNGramSource(hf, layer_idx=0, group_size=gs, bits=bits, coalesce_bytes=64)
+    out = np.array(src2.lookup(mx.array([[[3, 4, 5, 6]]])).astype(mx.float32))
+    assert len(hf.requests) == 3
+    assert np.abs(out - np.array(mem.lookup(mx.array([[[3, 4, 5, 6]]])).astype(mx.float32))).max() < 1e-6
+
+
+def test_engine_with_disk_ngram_source(tmp_path, monkeypatch):
+    """Same streaming dir as the engine test, but the n-gram shards are
+    removed from pinned and served from bin/ngram row files."""
+    from mlx_lm.models.switch_layers import SwitchLinear
+    from mlx_expert_sniper.calibrate import _build_engine
+    mx.random.seed(3)
+    args = ModelArgs(**{k: v for k, v in TINY.items() if k in ModelArgs.__dataclass_fields__})
+    model = Model(args)
+    nn.quantize(model, group_size=32, bits=4,
+                class_predicate=lambda p, m: isinstance(m, SwitchLinear) or ".ngram_embedding.shard_" in p)
+    mx.eval(model.parameters())
+    model.eval()
+    _write_streaming_dir(model, args, str(tmp_path))
+    # strip shards from pinned, write them as row files
+    pinned = mx.load(str(tmp_path / "pinned.safetensors"))
+    pinned = {k: v for k, v in pinned.items() if "ngram_embedding.shard_" not in k}
+    mx.save_safetensors(str(tmp_path / "pinned2.safetensors"), pinned)
+    shards = model.model.layers[0].ple.ple_embedding.ngram_embedding
+    geo = model.model.layers[0].ple.ple_embedding
+    for i in range(geo.num_shards):
+        m = getattr(shards, f"shard_{i}")
+        m.scales, m.biases = m.scales.astype(mx.bfloat16), m.biases.astype(mx.bfloat16)
+    _write_ngram_dir(shards, str(tmp_path / "bin" / "ngram"), geo.num_shards, geo.rows_per_shard, geo.head_dim, 32, 4)
+    cfg = json.load(open(tmp_path / "config.json"))
+    cfg["streaming"]["ngram_source"] = "disk"
+    cfg["streaming"]["ngram_dir"] = "bin/ngram"
+    cfg["streaming"]["pinned_file"] = "pinned2.safetensors"
+    json.dump(cfg, open(tmp_path / "config.json", "w"))
+
+    ids = _tokens()
+    ref = np.array(model(mx.array(ids[:, :6])))
+
+    class _Tok:
+        eos_token_id = EOS
+    import transformers
+    monkeypatch.setattr(transformers.AutoTokenizer, "from_pretrained",
+                        staticmethod(lambda *a, **k: _Tok()))
+    engine = _build_engine(str(tmp_path), cache_size=64)
+    assert engine.ngram_source_kind == "disk" and 0 in engine.ngram_sources
+    assert not hasattr(engine.model.model.layers[0].ple.ple_embedding, "ngram_embedding")
+    engine.reset_cache()
+    got = np.array(engine.forward(mx.array(ids[:, :6])))
+    d = np.abs(got - ref).max()
+    print(f"engine(disk ngram) vs model max|diff|={d:.3e}")
+    assert d < 1e-3
+
+
+# --------------------------------------------------------------------------- #
+# HFExpertReader: local sparse bin first, HF for holes
+# --------------------------------------------------------------------------- #
+
+def test_hf_expert_reader_local_then_hf(tmp_path, monkeypatch):
+    pytest.importorskip("fastapi")  # expert_network.node imports it
+    from mlx_lm.models.switch_layers import SwitchLinear
+    from expert_network.hf_reader import HFExpertReader
+    mx.random.seed(4)
+    args = ModelArgs(**{k: v for k, v in TINY.items() if k in ModelArgs.__dataclass_fields__})
+    model = Model(args)
+    nn.quantize(model, group_size=32, bits=4, class_predicate=lambda p, m: isinstance(m, SwitchLinear))
+    mx.eval(model.parameters())
+    _write_streaming_dir(model, args, str(tmp_path))
+    cfg = json.load(open(tmp_path / "config.json"))
+    cfg["streaming"]["source_repo"] = "fake/repo"
+    json.dump(cfg, open(tmp_path / "config.json", "w"))
+    # punch holes: zero out experts >= 4 in every layer and record which are real
+    full_blocks = {}
+    hdr = json.loads(open(tmp_path / "bin" / "layer_00.bin", "rb").read(PAGE_SIZE).rstrip(b"\x00"))["layout"]
+    bs, ds = hdr["expert_block_size"], hdr["data_start"]
+    for li in range(args.num_hidden_layers):
+        p = tmp_path / "bin" / f"layer_{li:02d}.bin"
+        with open(p, "r+b") as f:
+            for e in range(args.num_experts):
+                f.seek(ds + e * bs)
+                full_blocks[(li, e)] = f.read(bs)
+                if e >= 4:
+                    f.seek(ds + e * bs)
+                    f.write(b"\x00" * bs)
+    json.dump({"blocks": {f"{l}:{e}": "x" for (l, e) in full_blocks if e < 4}},
+              open(tmp_path / "manifest.partial.json", "w"))
+
+    class FakeHF:
+        num_layers = args.num_hidden_layers
+        def __init__(self):
+            self.fetched = []
+        def expert_layout(self, layer):
+            return dict(hdr)
+        def fetch_expert_block(self, layer, eid, layout=None):
+            self.fetched.append((layer, eid))
+            return full_blocks[(layer, eid)]
+    hf = FakeHF()
+    reader = HFExpertReader(str(tmp_path), num_layers=args.num_hidden_layers, cache_size=16, hf=hf)
+    reader.prefetch_experts(1, [2, 6])
+    got = reader.get_experts(0, [1, 5, 7])
+    assert sorted(got) == [1, 5, 7]
+    assert sorted(hf.fetched) == [(0, 5), (0, 7), (1, 6)]
+    ref = model.model.layers[0].mlp.switch_mlp
+    for e in (1, 5, 7):
+        for proj in ("gate_proj", "up_proj", "down_proj"):
+            for t in ("weight", "scales", "biases"):
+                assert np.array_equal(np.array(got[e][f"switch_mlp.{proj}.{t}"]),
+                                      np.array(getattr(ref, proj)[t][e]))
+    got1 = reader.get_experts(1, [2, 6])
+    assert sorted(hf.fetched) == [(0, 5), (0, 7), (1, 6)]  # served from prefetch, no refetch
+    assert reader.lru.contains(0, 5) and reader.lru.contains(1, 2)
+    assert reader.local_hits == 2 and reader.hf_reads == 3
+    assert "reads=" in reader.stats()
+    reader.close()

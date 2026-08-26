@@ -12,8 +12,11 @@ config.json keys read here (the full HF ``text_config`` dict plus):
   quantization              {"bits": 4, "group_size": 32, "mode": "affine"}
   streaming.pinned_file     pinned safetensors (default "pinned.safetensors")
   streaming.expert_dir      directory of layer_XX.bin expert files
-  streaming.ngram_dir       reserved: streamed n-gram tables (not implemented)
-  ngram_in_memory           bool, default True (n-gram shards live in pinned)
+  streaming.ngram_source    "memory" | "disk" | "hf" (default: memory unless
+                            ngram_in_memory is false, then disk)
+  streaming.ngram_dir       row files for "disk" (default bin/ngram)
+  streaming.source_repo     HF repo for "hf" (and the tokenizer fallback)
+  ngram_in_memory           legacy bool; ngram_source wins when present
   norm_weights_hf           optional bool: force whether the pinned norm
                             weights are raw HF (1 + w) values; auto-detected
                             from the conv1d layout when absent
@@ -102,16 +105,29 @@ class MoESniperEngineQwen4Exp:
         streaming = config.get("streaming", {})
 
         from .models.qwen4_exp import Model, ModelArgs
+        # n-gram table residency: "memory" (shards pinned), "disk"
+        # (bin/ngram row files), "hf" (HTTP Range from streaming.source_repo)
+        ngram_source = streaming.get("ngram_source")
+        if ngram_source is None:
+            ngram_source = "memory" if config.get("ngram_in_memory", True) else "disk"
+        self.ngram_source_kind = ngram_source
         args = ModelArgs.from_dict(dict(
             config,
             model_type=config.get("model_type", "qwen4_exp"),
-            ngram_in_memory=config.get("ngram_in_memory", streaming.get("ngram_in_memory", True)),
+            ngram_in_memory=(ngram_source == "memory"),
         ))
-        if not args.ngram_in_memory:
-            # TODO: streamed NGramSource over streaming.ngram_dir (see
-            # models/qwen4_exp.NGramSource). Until then the shards are pinned.
-            raise NotImplementedError("ngram_in_memory=False: streamed n-gram tables are not implemented yet")
         self.model = Model(args)
+        self.ngram_sources = {}
+        if ngram_source != "memory":
+            from .ngram_source import make_ngram_source
+            hf = None
+            for layer in self.model.layers:
+                if layer.ple is None:
+                    continue
+                src = make_ngram_source(ngram_source, config, MODEL_DIR, layer.layer_idx, hf=hf)
+                hf = getattr(src, "hf", hf)
+                layer.ple.ple_embedding.set_source(src)
+                self.ngram_sources[layer.layer_idx] = src
         from mlx_lm.models.switch_layers import SwitchLinear
 
         mx.set_memory_limit(14 * 1024**3)
@@ -153,11 +169,17 @@ class MoESniperEngineQwen4Exp:
         self.coact = CoActivationTracker(self.num_layers, warmup_tokens=3)
 
         from transformers import AutoTokenizer
-        try:
-            self.tokenizer = AutoTokenizer.from_pretrained(MODEL_DIR, trust_remote_code=True)
-        except Exception:
-            self.tokenizer = AutoTokenizer.from_pretrained(
-                config.get("tokenizer_repo", "Qwen/Qwen3.8-Flash-Next"), trust_remote_code=True)
+        candidates = [MODEL_DIR, config.get("tokenizer_repo"), streaming.get("source_repo"),
+                      "Qwen/Qwen3.8-Flash-Next"]
+        err = None
+        for c in [c for c in candidates if c]:
+            try:
+                self.tokenizer = AutoTokenizer.from_pretrained(c, trust_remote_code=True)
+                break
+            except Exception as e:  # noqa: BLE001
+                err = e
+        else:
+            raise RuntimeError(f"no tokenizer found (tried {candidates}): {err}")
         return pinned_gb
 
     def reset_cache(self):
