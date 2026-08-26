@@ -261,10 +261,142 @@ def fetch_partition(out, blocks, mine, num_layers, num_experts, block_size,
     return stats
 
 
+def fetch_from_hf(args, out):
+    """Take a partition directly from the source checkpoint on HuggingFace.
+
+    Same sparse layout on disk, same header, same block hashes — the only
+    difference is where the bytes come from. If the coordinator already has
+    a manifest for the model, every block is verified against it; if not
+    (you are the first machine), the hashes of what you fetched are written
+    to manifest.partial.json so the publisher can merge them."""
+    from .hf_source import HFCheckpoint
+    hf = HFCheckpoint(args.from_hf, jobs=max(2, args.jobs))
+    num_layers, num_experts = hf.num_layers, hf.num_experts
+    lay0 = hf.public_layout(0)
+    block_size = lay0["expert_block_size"]
+    if args.roster == "auto" or (args.roster and args.me):
+        # Same rule the node applies at start: rendezvous hashing over the
+        # live roster (plus me), so a machine knows its share before it
+        # downloads a byte. Re-run later to top up if the roster grew.
+        from .hrw import partition as hrw_partition
+        me = args.me or os.uname().nodename.lower()[:20]
+        model_key = args.model or f"{num_layers}x{num_experts}"
+        if args.roster == "auto":
+            try:
+                info = _get(f"{args.coordinator}/api/yield/roster?model={model_key}&me={me}")
+                roster = info.get("roster") or [me]
+            except Exception as e:  # noqa: BLE001
+                print(f"roster lookup failed ({type(e).__name__}); taking the whole model")
+                roster = [me]
+        else:
+            roster = args.roster.split(",")
+        if me not in roster:
+            roster.append(me)
+        mine = hrw_partition(roster, me, num_experts)
+        print(f"roster: {len(roster)} machine(s) on {model_key} — my share as {me!r}: "
+              f"{len(mine)}/{num_experts} experts")
+        args.partition = ",".join(str(e) for e in mine)
+    elif args.partition:
+        mine = parse_partition(args.partition, num_experts)
+    else:
+        sys.exit("give --partition, or --roster auto --me <node-id>")
+    total = len(mine) * num_layers
+    print(f"{args.from_hf}: {num_layers} layers x {num_experts} experts, "
+          f"{block_size / 1e6:.2f} MB blocks")
+    print(f"partition: {len(mine)} experts/layer = {total} blocks, "
+          f"{total * block_size / 1e9:.1f} GB (full model would be "
+          f"{num_experts * num_layers * block_size / 1e9:.0f} GB)\n")
+
+    want = {}
+    if args.model:
+        try:
+            info = _get(f"{args.coordinator}/api/yield/peers?model={args.model}&manifest=1",
+                        key=args.key)
+            want = (info.get("manifest") or {}).get("blocks") or {}
+            print(f"verifying against the published manifest ({len(want)} blocks)")
+        except Exception as e:  # noqa: BLE001
+            print(f"no manifest to verify against ({type(e).__name__}); trusting the source")
+
+    hf.write_config(out)
+    got_hashes = {}
+    stats = {"fetched": 0, "skipped": 0, "bytes": 0}
+    t0 = time.time()
+    for layer in range(num_layers):
+        lay = hf.expert_layout(layer)
+        tensors = {k: v for k, v in lay["tensors"].items()}
+        path = os.path.join(out, "bin", f"layer_{layer:02d}.bin")
+        header = {"layer_idx": layer, "num_experts": num_experts,
+                  "layout": {"expert_block_size": block_size,
+                             "data_start": PAGE_SIZE, "tensors": tensors}}
+        hj = json.dumps(header).encode()
+        size = PAGE_SIZE + num_experts * block_size
+        exists = os.path.exists(path) and os.path.getsize(path) == size
+        with open(path, "r+b" if exists else "wb") as f:
+            fd = f.fileno()
+            os.pwrite(fd, hj + b"\x00" * (PAGE_SIZE - len(hj)), 0)
+            if not exists:
+                f.truncate(size)
+            todo = []
+            for eid in mine:
+                w = want.get(f"{layer}:{eid}")
+                if w and _have_block(fd, PAGE_SIZE + eid * block_size, block_size, w):
+                    stats["skipped"] += 1
+                    got_hashes[f"{layer}:{eid}"] = w
+                else:
+                    todo.append(eid)
+
+            def one(eid, layer=layer, lay=lay):
+                data = hf.fetch_expert_block(layer, eid, lay)
+                h = hashlib.sha256(data).hexdigest()
+                w = want.get(f"{layer}:{eid}")
+                if w and w != h:
+                    raise RuntimeError(f"block {layer}:{eid} from {args.from_hf} does not "
+                                       f"match the published manifest — refusing to write it")
+                return eid, data, h
+            with ThreadPoolExecutor(max_workers=max(1, args.jobs)) as pool:
+                for eid, data, h in pool.map(one, todo):
+                    os.pwrite(fd, data, PAGE_SIZE + eid * block_size)
+                    got_hashes[f"{layer}:{eid}"] = h
+                    stats["fetched"] += 1
+                    stats["bytes"] += len(data)
+        done = stats["fetched"] + stats["skipped"]
+        rate = stats["bytes"] / 1e6 / max(0.1, time.time() - t0)
+        print(f"  layer {layer + 1}/{num_layers}  {done}/{total} blocks  "
+              f"({stats['skipped']} already had)  {rate:.0f} MB/s", end="\r", flush=True)
+    secs = time.time() - t0
+    print(f"\n{len(got_hashes)} blocks on disk in {secs:.0f}s: {stats['fetched']} fetched, "
+          f"{stats['skipped']} already had; {stats['bytes'] / 1e9:.1f} GB at "
+          f"{stats['bytes'] / 1e6 / max(0.1, secs):.0f} MB/s")
+    with open(os.path.join(out, "manifest.partial.json"), "w") as f:
+        json.dump({"model_type": hf.tc.get("model_type"), "source": args.from_hf,
+                   "num_layers": num_layers, "num_experts": num_experts,
+                   "expert_block_size": block_size, "tensors": lay0["tensors"],
+                   "blocks": got_hashes}, f)
+
+    if args.pinned:
+        print("\npinned trunk:")
+        hf.download_pinned(out)
+    if args.ngram:
+        print("\nn-gram tables:")
+        hf.download_ngram(out)
+
+    real = sum(os.stat(os.path.join(dp, fn)).st_blocks * 512
+               for dp, _, fns in os.walk(os.path.join(out, "bin")) for fn in fns)
+    print(f"on disk: {real / 1e9:.1f} GB (sparse)")
+    part = f"--roster auto --me {args.me}" if args.roster else f"--partition {args.partition}"
+    nxt = "" if args.pinned else f"\n  expert-fetch --from-hf {args.from_hf} {part} -o {out} --pinned   # trunk, if this machine also drives"
+    print(f"\nNext:{nxt}\n  expert-node --model-dir {out} --roster auto --me <id> --join <key>")
+
+
 def main():
     p = argparse.ArgumentParser(description="Fetch this machine's expert partition")
-    p.add_argument("--model", required=True, help="manifest key, e.g. 48x128 or a model name")
-    p.add_argument("--partition", required=True, help="0-31 · 0,3,9 · half:0")
+    p.add_argument("--model", default=None,
+                   help="manifest key, e.g. 48x128 or a model name (optional with --from-hf)")
+    p.add_argument("--partition", default=None, help="0-31 · 0,3,9 · half:0")
+    p.add_argument("--roster", default=None,
+                   help="'auto' (ask the coordinator) or a comma list of node ids; "
+                        "with --me, computes the partition by rendezvous hashing")
+    p.add_argument("--me", default=None, help="this machine's node id (with --roster)")
     p.add_argument("-o", "--out", required=True, help="streaming dir to create")
     p.add_argument("--key", default=os.environ.get("HERO_RUN_KEY"), help="hr_live_ key")
     p.add_argument("--coordinator", default="https://herorunai.com")
@@ -272,12 +404,25 @@ def main():
     p.add_argument("--jobs", type=int, default=6, help="parallel block fetches")
     p.add_argument("--node-id", default=None,
                    help="this machine's node id, for crediting the peers that seeded it")
+    p.add_argument("--from-hf", default=None, metavar="REPO",
+                   help="pull your partition straight from a HuggingFace MLX checkpoint "
+                        "by byte range (e.g. Vontra/Qwen3.8-Flash-Next-MLX-4bit); "
+                        "no peer needs to hold the model first")
+    p.add_argument("--pinned", action="store_true",
+                   help="with --from-hf: also fetch pinned.safetensors (the resident trunk)")
+    p.add_argument("--ngram", action="store_true",
+                   help="with --from-hf: also fetch the n-gram tables (drivers only)")
     p.add_argument("--no-attest", action="store_true",
                    help="do not report who delivered the blocks (they go unpaid)")
     args = p.parse_args()
 
     out = os.path.expanduser(args.out)
     os.makedirs(os.path.join(out, "bin"), exist_ok=True)
+
+    if args.from_hf:
+        return fetch_from_hf(args, out)
+    if not args.model:
+        p.error("--model is required unless --from-hf is given")
 
     # --- who has this model, and what should it hash to -------------------
     url = f"{args.coordinator}/api/yield/peers?model={args.model}&manifest=1"
@@ -295,6 +440,8 @@ def main():
     if not blocks:
         sys.exit(f"no manifest published for {args.model}; the operator must upload one first.")
 
+    if not args.partition:
+        p.error("--partition is required (or use --from-hf with --roster auto)")
     num_layers = int(layout.get("num_layers") or manifest.get("num_layers"))
     num_experts = int(layout.get("num_experts") or manifest.get("num_experts"))
     block_size = int(layout.get("expert_block_size") or manifest.get("expert_block_size"))

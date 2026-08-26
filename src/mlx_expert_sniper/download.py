@@ -51,6 +51,16 @@ MODEL_REGISTRY = {
         "default_dir": "olmoe-stream",
         "description": "OLMoE-1B-7B 4-bit (3.6 GB, 64 experts, 8 GB Macs / network demo)",
     },
+    # Qwen3.8-Flash-Next (qwen4_exp) — 180B total, 512 experts, 10 active.
+    # ~4 GB resident trunk; everything else streams. Meant for the mesh:
+    #   expert-fetch --from-hf Vontra/Qwen3.8-Flash-Next-MLX-4bit --partition ...
+    # takes your slice by byte range; this full download needs ~115 GB free.
+    "qwen3.8-flash-next": {
+        "repo": "Vontra/Qwen3.8-Flash-Next-MLX-4bit",
+        "default_dir": "qwen38-flash-next-stream",
+        "description": "Qwen3.8-Flash-Next 4-bit (112 GB: 75 GB experts + 32 GB n-gram, "
+                       "512 experts, 48 layers; mesh model — needs 64+ GB RAM alone)",
+    },
     # Gemma 4 (Google) — NEW ARCHITECTURE
     "gemma4-26b": {
         "repo": "google/gemma-4-26B-A4B-it",
@@ -238,6 +248,31 @@ def _write_layer(output_dir, layer_idx, lt, num_experts, verify=True):
     return layer_bytes
 
 
+def _write_ngram_tensor(output_dir, name, t):
+    """bin/ngram/<shard_i.weight|scales|biases>: the tensor's bytes verbatim
+    plus a line in layout.json — the same files expert_network.hf_source
+    produces, so both paths yield one on-disk format."""
+    import mlx.core as mx
+    d = os.path.join(output_dir, "bin", "ngram")
+    os.makedirs(d, exist_ok=True)
+    local = name.split("ngram_embedding.")[1]
+    path = os.path.join(d, local)
+    mx.eval(t)
+    if not (os.path.exists(path) and os.path.getsize(path) == t.nbytes):
+        with open(path + ".part", "wb") as f:
+            f.write(_tensor_bytes(t))
+        os.replace(path + ".part", path)
+    lp = os.path.join(d, "layout.json")
+    layout = json.load(open(lp)) if os.path.exists(lp) else {"tensors": {}}
+    st_dtype = {"mlx.core.bfloat16": "BF16", "mlx.core.uint32": "U32",
+                "mlx.core.float16": "F16", "mlx.core.float32": "F32"}.get(str(t.dtype), str(t.dtype))
+    layout["tensors"][local] = {"shape": list(t.shape), "dtype": st_dtype,
+                                "row_bytes": int(np.prod(t.shape[1:])) * t.dtype.size,
+                                "file": local, "source": name}
+    with open(lp, "w") as f:
+        json.dump(layout, f)
+
+
 def _shard_names(download_dir):
     """Full shard list from the safetensors index (works even when some
     shards were already deleted by an interrupted run), else glob."""
@@ -373,6 +408,11 @@ def _preprocess(download_dir, output_dir, delete_shards=True, repo=None):
                 layer_idx = int(m.group(1))
                 local_name = k.split(f"layers.{layer_idx}.mlp.")[-1]
                 expert_keys.setdefault(layer_idx, {})[local_name] = v
+            elif "ngram_embedding.shard_" in k:
+                # Hashed n-gram tables (Qwen3.8-Flash-Next: 32 GB) are a
+                # lookup, like experts — rows are read on demand, so they go
+                # to row-addressable raw files instead of the pinned trunk.
+                _write_ngram_tensor(output_dir, k, v)
             else:
                 shard_pinned[k] = v
 
@@ -461,6 +501,15 @@ def _preprocess(download_dir, output_dir, delete_shards=True, repo=None):
         "quantization": config.get("quantization", {"bits": 4, "group_size": 64}),
         "streaming": {"pinned_file": "pinned.safetensors", "expert_dir": "bin"},
     }
+    if "qwen4" in str(tc.get("model_type", "")) or config.get("model_type") == "qwen4_exp":
+        # qwen4_exp: hyper-connections, n-gram/PLE, sparse indexer... the
+        # engine reads the full text config rather than a curated subset.
+        full = dict(tc)
+        full.update(stream_config)
+        full["model_type"] = "qwen4_exp"
+        full["text_model_type"] = tc.get("model_type")
+        full["streaming"]["ngram_dir"] = "bin/ngram"
+        stream_config = full
     # qwen3_moe-family keys (engine_30b reads these with .get defaults):
     # persist the source model's real values when present, omit otherwise
     # so the engine-side defaults still apply.

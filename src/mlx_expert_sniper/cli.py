@@ -209,32 +209,59 @@ def cmd_publish(args):
     and prints the command other people run to take a slice. Your machine
     then seeds those blocks to them, which is itself paid work."""
     import hashlib, json, urllib.request
-    model_dir = os.path.expanduser(args.model_dir)
-    with open(os.path.join(model_dir, "config.json")) as f:
-        config = json.load(f)
-    num_layers = config["num_hidden_layers"]
-    num_experts = (config.get("num_experts") or config.get("n_routed_experts"))
-    key = args.name or f"{num_layers}x{num_experts}"
     api_key = args.key or os.environ.get("HERO_RUN_KEY")
     if not api_key:
         sys.exit("Need a key: --key hr_live_... (or HERO_RUN_KEY)")
 
+    if not args.from_hf and not args.model_dir:
+        sys.exit("publish needs a model dir, or --from-hf <repo>")
     PAGE = 16384
-    blocks, total = {}, 0
-    for li in range(num_layers):
-        path = os.path.join(model_dir, "bin", f"layer_{li:02d}.bin")
-        with open(path, "rb") as f:
-            header = json.loads(f.read(PAGE).rstrip(b"\x00"))
-            bsize = header["layout"]["expert_block_size"]
-            for eid in range(num_experts):
-                f.seek(PAGE + eid * bsize)
-                blocks[f"{li}:{eid}"] = hashlib.sha256(f.read(bsize)).hexdigest()
-                total += bsize
-        print(f"  hashing layer {li + 1}/{num_layers}", end="\r", flush=True)
+    if args.from_hf:
+        # Stream the checkpoint through sha256 straight from HuggingFace: the
+        # publisher never needs the disk to hold the model. Flash-Next is
+        # ~75 GB of experts; at CDN speed that is under an hour.
+        from expert_network.hf_source import HFCheckpoint
+        hf = HFCheckpoint(args.from_hf, jobs=args.jobs)
+        num_layers, num_experts = hf.num_layers, hf.num_experts
+        lay0 = hf.public_layout(0)
+        bsize = lay0["expert_block_size"]
+        key = args.name or f"{num_layers}x{num_experts}"
+        print(f"{args.from_hf}: {num_layers} layers x {num_experts} experts, "
+              f"{bsize / 1e6:.2f} MB blocks — streaming "
+              f"{num_layers * num_experts * bsize / 1e9:.0f} GB through sha256")
+        blocks = hf.hash_all_blocks()
+        total = len(blocks) * bsize
+        manifest = {"model_type": hf.tc.get("model_type"), "num_layers": num_layers,
+                    "num_experts": num_experts, "expert_block_size": bsize,
+                    "tensors": lay0["tensors"], "source": args.from_hf, "blocks": blocks}
+        model_dir = None
+    else:
+        model_dir = os.path.expanduser(args.model_dir)
+        with open(os.path.join(model_dir, "config.json")) as f:
+            config = json.load(f)
+        num_layers = config["num_hidden_layers"]
+        num_experts = (config.get("num_experts") or config.get("n_routed_experts"))
+        key = args.name or f"{num_layers}x{num_experts}"
+        blocks, total, tensors = {}, 0, None
+        for li in range(num_layers):
+            path = os.path.join(model_dir, "bin", f"layer_{li:02d}.bin")
+            with open(path, "rb") as f:
+                header = json.loads(f.read(PAGE).rstrip(b"\x00"))
+                bsize = header["layout"]["expert_block_size"]
+                tensors = tensors or header["layout"].get("tensors")
+                for eid in range(num_experts):
+                    f.seek(PAGE + eid * bsize)
+                    blocks[f"{li}:{eid}"] = hashlib.sha256(f.read(bsize)).hexdigest()
+                    total += bsize
+            print(f"  hashing layer {li + 1}/{num_layers}", end="\r", flush=True)
+        manifest = {"model_type": config.get("model_type"), "num_layers": num_layers,
+                    "num_experts": num_experts, "expert_block_size": bsize,
+                    "tensors": tensors, "blocks": blocks}
     print(f"\n{len(blocks)} blocks, {total / 1e9:.1f} GB")
-
-    manifest = {"model_type": config.get("model_type"), "num_layers": num_layers,
-                "num_experts": num_experts, "expert_block_size": bsize, "blocks": blocks}
+    if args.save:
+        with open(os.path.expanduser(args.save), "w") as f:
+            json.dump(manifest, f)
+        print(f"manifest saved to {args.save}")
     body = json.dumps({"model": key, "manifest": manifest}).encode()
     req = urllib.request.Request(f"{args.coordinator}/api/yield/manifest", data=body,
                                  headers={"Content-Type": "application/json",
@@ -252,8 +279,12 @@ def cmd_publish(args):
     print(f"\nOthers join it with:")
     print(f"  expert-fetch --model {key} --partition <yours> -o ~/models/{key}")
     print(f"  expert-node --model-dir ~/models/{key} --roster auto --me <id> --join <key>")
-    print(f"\nServe it yourself so there is something to pull from:")
-    print(f"  expert-node --model-dir {model_dir} --roster auto --me $(hostname) --join {api_key[:12]}…")
+    if args.from_hf:
+        print(f"  or straight from the source, no peer needed:")
+        print(f"  expert-fetch --from-hf {args.from_hf} --model {key} --partition <yours> -o ~/models/{key}")
+    else:
+        print(f"\nServe it yourself so there is something to pull from:")
+        print(f"  expert-node --model-dir {model_dir} --roster auto --me $(hostname) --join {api_key[:12]}…")
 
 
 def cmd_manifest(args):
@@ -366,7 +397,13 @@ def main():
 
     # publish — post a prepared model so the rest of the network can serve it
     p = sub.add_parser("publish", help="Post a prepared model to the network")
-    p.add_argument("model_dir", help="Path to sniper model directory")
+    p.add_argument("model_dir", nargs="?", default=None,
+                   help="Path to sniper model directory (omit with --from-hf)")
+    p.add_argument("--from-hf", default=None, metavar="REPO",
+                   help="hash the experts straight from a HuggingFace MLX checkpoint; "
+                        "no local copy of the model needed")
+    p.add_argument("--jobs", type=int, default=12, help="parallel range reads for --from-hf")
+    p.add_argument("--save", default=None, help="also write the manifest JSON here")
     p.add_argument("--name", default=None, help="model key others will use (default: layersXexperts)")
     p.add_argument("--key", default=None, help="hr_live_ key (or HERO_RUN_KEY)")
     p.add_argument("--coordinator", default="https://herorunai.com")
