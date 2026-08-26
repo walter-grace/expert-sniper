@@ -52,6 +52,10 @@ def load_engine(model_dir, pinned_only=False):
         from . import engine_gemma4 as engine_mod
         engine_mod.MODEL_DIR = model_dir
         from .engine_gemma4 import MoESniperEngineGemma4 as EngineClass
+    elif "qwen4_exp" in model_type:
+        from . import engine_qwen4exp as engine_mod
+        engine_mod.MODEL_DIR = model_dir
+        from .engine_qwen4exp import MoESniperEngineQwen4Exp as EngineClass
     elif "qwen3_next" in model_type:
         from . import engine_next as engine_mod
         engine_mod.MODEL_DIR = model_dir
@@ -200,6 +204,8 @@ def generate_stream(engine, messages, bias=0.0, max_tokens=200):
     is_gemma4 = hasattr(engine, 'per_expert_scales')  # Gemma 4 engine has this
     if is_gemma4:
         return _generate_stream_gemma4(engine, messages, max_tokens)
+    if getattr(engine, "own_forward", False):  # qwen4_exp: hyper-connection residual
+        return _generate_stream_own_forward(engine, messages, max_tokens)
 
     engine.reset_cache()
     tok = engine.tokenizer
@@ -232,6 +238,39 @@ def generate_stream(engine, messages, bias=0.0, max_tokens=200):
             break
         yield chunk
         logits = forward(token.reshape(1, 1))
+        mx.eval(logits)
+
+
+def _generate_stream_own_forward(engine, messages, max_tokens=200):
+    """Generator for engines that own their forward pass (qwen4_exp). The
+    cache-aware routing bias is not applied: that lives in make_forward."""
+    import mlx.core as mx
+
+    engine.reset_cache()
+    tok = engine.tokenizer
+    try:
+        text = tok.apply_chat_template(messages, tokenize=False,
+                                        add_generation_prompt=True, enable_thinking=False)
+    except Exception:
+        try:
+            text = tok.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+        except Exception:
+            text = messages[-1]["content"]
+    tokens = tok.encode(text)
+    logits = engine.forward(mx.array([tokens]))
+    mx.eval(logits)
+    eos_ids = eos_token_ids(tok)
+    for _ in range(max_tokens):
+        token = mx.argmax(logits[:, -1, :], axis=-1)
+        mx.eval(token)
+        tid = token.item()
+        if tid in eos_ids:
+            break
+        chunk = tok.decode([tid])
+        if any(st in chunk for st in STOP_TOKENS):
+            break
+        yield chunk
+        logits = engine.forward(token.reshape(1, 1))
         mx.eval(logits)
 
 

@@ -31,10 +31,10 @@ def perplexity(engine, bias=0.0, text_path=None, seq_len=512, max_chunks=8,
     import mlx.core as mx
 
     is_gemma4 = hasattr(engine, "per_expert_scales")
-    if is_gemma4:
+    if is_gemma4 or getattr(engine, "own_forward", False):
         if bias > 0:
-            raise ValueError("routing bias is not supported on the Gemma 4 "
-                             "engine — eval with bias=0")
+            raise ValueError("routing bias is not supported on the Gemma 4 / "
+                             "qwen4_exp engines — eval with bias=0")
         forward = engine.forward
     else:
         from .generate import make_forward

@@ -90,6 +90,10 @@ def _build_engine(model_dir, cache_size, enable_prediction=True):
         from .engine_gemma4 import MoESniperEngineGemma4 as EngineClass
         from . import engine_gemma4 as engine_mod
         engine_mod.MODEL_DIR = model_dir
+    elif "qwen4_exp" in model_type:
+        from .engine_qwen4exp import MoESniperEngineQwen4Exp as EngineClass
+        from . import engine_qwen4exp as engine_mod
+        engine_mod.MODEL_DIR = model_dir
     elif "qwen3_next" in model_type:
         from .engine_next import MoESniperEngineNext as EngineClass
         from . import engine_next as engine_mod
@@ -129,7 +133,28 @@ def run_shared_calibration_pass(engine, prompts, tokens_per_prompt=20):
 
     has_ssm = hasattr(engine.model.model, 'fa_idx')
 
+    def record_route(i, active_ids, gate_weights):
+        nonlocal prev_layer_experts
+        active_set = list(set(active_ids))
+        for eid, gw in zip(active_ids, gate_weights):
+            count[i, eid] += 1
+            gate_sum[i, eid] += gw
+        if i > 0 and (i - 1) in prev_layer_experts:
+            for prev_eid in prev_layer_experts[i - 1]:
+                for cur_eid in active_set:
+                    coact[i - 1, prev_eid, cur_eid] += 1
+        prev_layer_experts[i] = set(active_set)
+
     def instrumented_forward(input_ids):
+        nonlocal prev_layer_experts
+        if getattr(engine, "own_forward", False):
+            # engines whose residual structure differs from the Qwen
+            # pre-norm layout (qwen4_exp) expose a routing callback instead
+            prev_layer_experts = {}
+            return engine.forward(input_ids, on_route=record_route)
+        return _qwen_instrumented_forward(input_ids)
+
+    def _qwen_instrumented_forward(input_ids):
         nonlocal prev_layer_experts
         from mlx_lm.models.base import create_attention_mask
         h = engine.model.model.embed_tokens(input_ids)
